@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BASE="/opt/genesis-admin-agent"
-REPO_URL="${GENESIS_AGENT_REPO:-https://github.com/sircagev/genesis-admin-agent.git}"
+REPO_URL="${GENESIS_AGENT_REPO:-https://github.com/sircagev/genesis-admin-agent2.git}"
 
 CONTROLLER=""
 DATABASE=""
