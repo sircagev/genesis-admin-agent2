@@ -23,25 +23,37 @@ def _stop(_signum, _frame):
     STOP = True
 
 
-def ensure_enrolled(config, client):
-    if config.get("agent_id") and config.get("agent_token"):
-        return
+def try_enroll(config, client):
+    if config.is_enrolled():
+        return True
 
-    token = config.get("enrollment_token")
-    code = config.get("server_code")
-    if not token or not code:
-        raise RuntimeError(
-            "Falta enrollment_token o server_code en config/config.yaml."
+    token = str(config.get("enrollment_token") or "").strip()
+    code = str(config.get("server_code") or "").strip()
+
+    if not token:
+        _logger.error(
+            "Agente no enrolado. Genere un token en Odoo y ejecute "
+            "`sudo genesis-agent reenroll TOKEN`."
         )
+        return False
 
-    inventory = collect_inventory(__version__)
-    result = client.enroll(inventory)
+    try:
+        result = client.enroll(collect_inventory(__version__))
+    except Exception as exc:  # pylint: disable=broad-except
+        _logger.error("No fue posible enrolar el agente: %s", exc)
+        return False
+
     if not result.get("success"):
-        raise RuntimeError(result.get("message") or "Falló enrolamiento.")
+        _logger.error(
+            "Falló enrolamiento: %s",
+            result.get("message") or "respuesta desconocida",
+        )
+        return False
 
     config.save_identity(result["agent_id"], result["agent_token"])
-    client.config.reload()
+    config.reload()
     _logger.info("Agente registrado para servidor %s", code)
+    return True
 
 
 def main():
@@ -50,14 +62,24 @@ def main():
 
     config = AgentConfig()
     client = ControllerClient(config)
-    ensure_enrolled(config, client)
-    executor = JobExecutor(config)
 
+    _logger.info("Genesis Infrastructure Agent %s iniciado", __version__)
+
+    # Do not crash-loop forever when an enrollment token is stale.
+    while not STOP and not config.is_enrolled():
+        if try_enroll(config, client):
+            break
+        time.sleep(30)
+        config.reload()
+        client = ControllerClient(config)
+
+    if STOP:
+        return
+
+    executor = JobExecutor(config)
     poll_interval = max(int(config.get("poll_interval") or 3), 1)
     heartbeat_interval = max(int(config.get("heartbeat_interval") or 30), 10)
     next_heartbeat = 0.0
-
-    _logger.info("Genesis Infrastructure Agent %s iniciado", __version__)
 
     while not STOP:
         now = time.monotonic()
@@ -80,15 +102,16 @@ def main():
             try:
                 result = executor.execute(job)
                 success = bool(result.get("success", True))
-                if success:
-                    client.job_result(job_id, True, result=result)
-                else:
-                    client.job_result(
-                        job_id,
-                        False,
-                        result=result,
-                        error=result.get("message") or "Operación fallida",
-                    )
+                client.job_result(
+                    job_id,
+                    success,
+                    result=result,
+                    error=(
+                        ""
+                        if success
+                        else result.get("message") or "Operación fallida"
+                    ),
+                )
             except Exception as exc:  # pylint: disable=broad-except
                 _logger.exception("Trabajo %s falló", job_id)
                 client.job_result(

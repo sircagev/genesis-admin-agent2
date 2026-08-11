@@ -10,28 +10,35 @@ class ControllerClient:
         self.session = requests.Session()
 
     def _url(self, path):
+        return f"{self.base}{path}"
+
+    def _base_headers(self):
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
         database = str(self.config.get("database") or "").strip()
-        url = f"{self.base}{path}"
         if database:
-            separator = "&" if "?" in url else "?"
-            url = f"{url}{separator}db={database}"
-        return url
+            headers["X-Odoo-Database"] = database
+        return headers
 
     def _identity_headers(self):
-        agent_id = self.config.get("agent_id")
-        agent_token = self.config.get("agent_token")
-        return {
-            "X-Agent-ID": agent_id or "",
-            "X-Agent-Token": agent_token or "",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        headers = self._base_headers()
+        headers.update(
+            {
+                "X-Agent-ID": self.config.get("agent_id") or "",
+                "X-Agent-Token": self.config.get("agent_token") or "",
+            }
+        )
+        return headers
 
     def _post(self, path, payload, identity=True):
-        headers = self._identity_headers() if identity else {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        headers = (
+            self._identity_headers()
+            if identity
+            else self._base_headers()
+        )
+
         response = self.session.post(
             self._url(path),
             json=payload,
@@ -39,8 +46,20 @@ class ControllerClient:
             timeout=self.timeout,
             verify=self.verify,
         )
-        response.raise_for_status()
-        return response.json()
+
+        if not response.ok:
+            body = (response.text or "").strip()
+            raise RuntimeError(
+                f"HTTP {response.status_code} llamando {self._url(path)}: "
+                f"{body[:1200]}"
+            )
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"El controlador no devolvió JSON en {self._url(path)}."
+            ) from exc
 
     def enroll(self, inventory):
         return self._post(
@@ -54,7 +73,10 @@ class ControllerClient:
         )
 
     def heartbeat(self, inventory):
-        return self._post("/infra/agent/v1/heartbeat", {"inventory": inventory})
+        return self._post(
+            "/infra/agent/v1/heartbeat",
+            {"inventory": inventory},
+        )
 
     def next_job(self):
         return self._post("/infra/agent/v1/jobs/next", {})

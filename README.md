@@ -1,49 +1,53 @@
-# Genesis Infrastructure Agent 2.0
+# Genesis Infrastructure Agent 2.1.0
 
-El agente ya no publica una API en `0.0.0.0:8010`.
+El agente inicia conexiones HTTPS hacia el Administrador Odoo. No abre un
+puerto administrativo entrante.
 
-El servidor inicia conexiones HTTPS hacia el Odoo Administrador:
+## Comando administrativo
 
-1. Enrolamiento con token de un solo uso.
-2. Heartbeat.
-3. Solicitud de trabajos.
-4. Ejecución de operaciones tipadas.
-5. Envío de resultados.
+El instalador crea:
 
-## Trabajos soportados
+```text
+/usr/local/bin/genesis-agent
+```
 
-- `service.status`
-- `service.start`
-- `service.stop`
-- `service.restart`
-- `service.logs`
-- `provision.prepare`
-- `provision.create`
-
-No existe un endpoint para ejecutar comandos shell arbitrarios.
-
-## Instalación
+Comandos:
 
 ```bash
-sudo bash install.sh   --controller https://ADMIN.DOMINIO   --server-code SERV01   --enroll-token TOKEN
+sudo genesis-agent status
+sudo genesis-agent doctor
+sudo genesis-agent logs
+sudo genesis-agent restart
+sudo genesis-agent update
+sudo genesis-agent reenroll TOKEN_NUEVO
 ```
 
-El token de enrolamiento se borra del YAML después del registro.
+También puede cambiar parámetros durante el re-enrolamiento:
 
-
-## Repositorio de módulos privados
-
-La configuración soporta el esquema usado por Genesis:
-
-```yaml
-provision:
-  custom_addons_repo: "https://github.com/ORGANIZACION/modulosFE19.git"
-  custom_addons_branch: "main"
-  custom_addons_subpaths:
-    - "custom_addons"
-    - "modulos"
+```bash
+sudo genesis-agent reenroll   --controller 'https://admin.midominio.com'   --database 'admin_db'   --server-code 'CONTABO-123'   --token 'TOKEN'
 ```
 
-Si el repositorio es privado, `install.sh --github-token TOKEN` guarda el token
-en `/opt/genesis-admin-agent/.env` con permisos 600. Git usa `GIT_ASKPASS`; el
-token no se agrega a la URL del repositorio.
+## Instalador idempotente
+
+`install.sh` se puede ejecutar nuevamente. Si la instalación ya tiene
+`agent_id` y `agent_token`, conserva la identidad y solo actualiza código,
+dependencias, configuración base y systemd.
+
+Para forzar un nuevo registro desde el instalador:
+
+```bash
+sudo bash install.sh ... --force-reenroll
+```
+
+Para recuperación normal se recomienda `genesis-agent reenroll`.
+
+## Multi-base de Odoo
+
+Todas las llamadas envían:
+
+```text
+X-Odoo-Database: <database>
+```
+
+No se utiliza `?db=`.

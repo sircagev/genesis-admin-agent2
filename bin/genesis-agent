@@ -1,0 +1,294 @@
+#!/opt/genesis-admin-agent/venv/bin/python
+import argparse
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+BASE = Path("/opt/genesis-admin-agent")
+sys.path.insert(0, str(BASE))
+
+from agent import __version__  # noqa: E402
+from agent.client import ControllerClient  # noqa: E402
+from agent.config import AgentConfig  # noqa: E402
+from agent.inventory import collect_inventory  # noqa: E402
+
+
+SERVICE = "genesis-admin-agent.service"
+
+
+def run(cmd, check=True, capture=False):
+    result = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        output = (result.stdout or "").strip()
+        raise SystemExit(
+            f"Comando falló ({result.returncode}): {' '.join(cmd)}"
+            + (f"\n{output}" if output else "")
+        )
+    return result
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise SystemExit("Ejecute este comando con sudo/root.")
+
+
+def load_config():
+    try:
+        return AgentConfig()
+    except Exception as exc:
+        raise SystemExit(f"Configuración inválida: {exc}") from exc
+
+
+def service_is_active():
+    result = run(
+        ["systemctl", "is-active", SERVICE],
+        check=False,
+        capture=True,
+    )
+    return (result.stdout or "").strip() == "active"
+
+
+def cmd_status(_args):
+    config = load_config()
+    print("Genesis Infrastructure Agent")
+    print(f"Versión:       {__version__}")
+    print(
+        f"Servicio:      {'RUNNING' if service_is_active() else 'STOPPED'}"
+    )
+    print(f"Controlador:   {config.get('controller_url')}")
+    print(f"Base:          {config.get('database')}")
+    print(f"Servidor:      {config.get('server_code')}")
+    print(f"Enrolado:      {'SÍ' if config.is_enrolled() else 'NO'}")
+    if config.get("agent_id"):
+        print(f"Agent ID:      {config.get('agent_id')}")
+
+    if config.is_enrolled():
+        try:
+            client = ControllerClient(config)
+            result = client.heartbeat(collect_inventory(__version__))
+            print(
+                "Controlador:   "
+                + ("OK" if result.get("success") else "RESPUESTA NO OK")
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"Controlador:   ERROR - {exc}")
+            raise SystemExit(1)
+
+
+def cmd_reenroll(args):
+    require_root()
+    config = load_config()
+
+    token = (args.token_option or args.token or "").strip()
+    if not token:
+        raise SystemExit(
+            "Uso: sudo genesis-agent reenroll TOKEN\n"
+            "o: sudo genesis-agent reenroll --token TOKEN"
+        )
+
+    run(["systemctl", "stop", SERVICE], check=False)
+
+    config.prepare_reenrollment(
+        token=token,
+        controller_url=args.controller,
+        database=args.database,
+        server_code=args.server_code,
+    )
+
+    print("Configuración preparada. Iniciando agente...")
+    run(["systemctl", "start", SERVICE])
+
+    deadline = time.time() + args.wait
+    while time.time() < deadline:
+        time.sleep(1)
+        try:
+            config.reload()
+        except Exception:
+            continue
+        if config.is_enrolled():
+            print("✓ Agente enrolado correctamente.")
+            print(f"✓ Agent ID: {config.get('agent_id')}")
+            try:
+                result = ControllerClient(config).heartbeat(
+                    collect_inventory(__version__)
+                )
+                if result.get("success"):
+                    print("✓ Heartbeat con el Administrador: OK")
+                    return
+            except Exception:
+                pass
+
+    print("No se confirmó el enrolamiento dentro del tiempo esperado.")
+    print("Últimos logs:")
+    run(
+        ["journalctl", "-u", SERVICE, "-n", "50", "--no-pager"],
+        check=False,
+    )
+    raise SystemExit(1)
+
+
+def cmd_restart(_args):
+    require_root()
+    run(["systemctl", "restart", SERVICE])
+    time.sleep(1)
+    run(["systemctl", "--no-pager", "--full", "status", SERVICE], check=False)
+
+
+def cmd_start(_args):
+    require_root()
+    run(["systemctl", "start", SERVICE])
+
+
+def cmd_stop(_args):
+    require_root()
+    run(["systemctl", "stop", SERVICE])
+
+
+def cmd_logs(args):
+    run(
+        [
+            "journalctl",
+            "-u",
+            SERVICE,
+            "-n",
+            str(args.lines),
+            "--no-pager",
+        ],
+        check=False,
+    )
+
+
+def cmd_doctor(_args):
+    config = load_config()
+    failures = 0
+
+    print("Genesis Agent Doctor")
+
+    checks = [
+        ("Configuración YAML", True),
+        ("Servicio systemd instalado", Path(
+            "/etc/systemd/system/genesis-admin-agent.service"
+        ).exists()),
+        ("Virtualenv", (BASE / "venv/bin/python").exists()),
+        ("Repositorio Git", (BASE / ".git").exists()),
+        ("Enrolado", config.is_enrolled()),
+    ]
+
+    for name, ok in checks:
+        print(f"{'✓' if ok else '✗'} {name}")
+        failures += 0 if ok else 1
+
+    try:
+        client = ControllerClient(config)
+        if config.is_enrolled():
+            result = client.heartbeat(collect_inventory(__version__))
+            ok = bool(result.get("success"))
+        else:
+            ok = False
+    except Exception as exc:  # pylint: disable=broad-except
+        ok = False
+        print(f"  Error controlador: {exc}")
+
+    print(f"{'✓' if ok else '✗'} Comunicación con Administrador")
+    failures += 0 if ok else 1
+
+    if failures:
+        raise SystemExit(1)
+
+
+def cmd_update(_args):
+    require_root()
+
+    if not (BASE / ".git").exists():
+        raise SystemExit(
+            f"{BASE} no es un repositorio Git; no se puede actualizar."
+        )
+
+    print("Actualizando código...")
+    run(["git", "-C", str(BASE), "fetch", "--all", "--prune"])
+    run(["git", "-C", str(BASE), "reset", "--hard", "origin/main"])
+
+    print("Actualizando dependencias...")
+    run(
+        [
+            str(BASE / "venv/bin/pip"),
+            "install",
+            "--upgrade",
+            "-r",
+            str(BASE / "requirements.txt"),
+        ]
+    )
+
+    cli = BASE / "bin/genesis-agent"
+    cli.chmod(0o755)
+    link = Path("/usr/local/bin/genesis-agent")
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    link.symlink_to(cli)
+
+    service_tpl = BASE / "systemd/genesis-admin-agent.service.tpl"
+    service_dst = Path("/etc/systemd/system/genesis-admin-agent.service")
+    service_dst.write_text(service_tpl.read_text(encoding="utf-8"), encoding="utf-8")
+
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "restart", SERVICE])
+    print("✓ Agente actualizado y reiniciado.")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="genesis-agent",
+        description="Administración local de Genesis Infrastructure Agent.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("status", help="Estado local y comunicación")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("reenroll", help="Registrar nuevamente este servidor")
+    p.add_argument("token", nargs="?")
+    p.add_argument("--token", dest="token_option")
+    p.add_argument("--controller")
+    p.add_argument("--database")
+    p.add_argument("--server-code")
+    p.add_argument("--wait", type=int, default=30)
+    p.set_defaults(func=cmd_reenroll)
+
+    p = sub.add_parser("restart", help="Reiniciar el agente")
+    p.set_defaults(func=cmd_restart)
+
+    p = sub.add_parser("start", help="Iniciar el agente")
+    p.set_defaults(func=cmd_start)
+
+    p = sub.add_parser("stop", help="Detener el agente")
+    p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("logs", help="Ver logs del agente")
+    p.add_argument("-n", "--lines", type=int, default=100)
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("doctor", help="Diagnóstico rápido")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("update", help="Actualizar desde origin/main")
+    p.set_defaults(func=cmd_update)
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
