@@ -5,12 +5,14 @@ from .commands import (
     systemd_status,
 )
 from .provisioner import OdooProvisioner
+from .discovery import OdooServiceDiscovery
 
 
 class JobExecutor:
     def __init__(self, config):
         self.config = config
         self.provisioner = OdooProvisioner(config)
+        self.discovery = OdooServiceDiscovery(config)
         self.allowed_exact = set(config.get("allowed_exact") or [])
         self.allowed_prefix = tuple(config.get("allowed_prefix") or [])
         self.default_log_lines = int(config.get("log_default_lines") or 200)
@@ -25,6 +27,7 @@ class JobExecutor:
             "service.stop": self.service_stop,
             "service.restart": self.service_restart,
             "service.logs": self.service_logs,
+            "inventory.services": self.inventory_services,
             "provision.prepare": self.provision_prepare,
             "provision.adopt": self.provision_adopt,
             "provision.create": self.provision_create,
@@ -144,3 +147,6 @@ class JobExecutor:
 
     def provision_create(self, payload):
         return self.provisioner.create(payload)
+
+    def inventory_services(self, _payload):
+        return self.discovery.discover()

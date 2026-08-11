@@ -72,6 +72,12 @@ class ControllerClient:
             identity=False,
         )
 
+    def sync_services(self, services):
+        return self._post(
+            "/infra/agent/v1/services/sync",
+            {"services": services},
+        )
+
     def heartbeat(self, inventory):
         return self._post(
             "/infra/agent/v1/heartbeat",

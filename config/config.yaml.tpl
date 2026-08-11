@@ -9,6 +9,7 @@ agent_token: ""
 verify_tls: true
 poll_interval: 3
 heartbeat_interval: 30
+service_sync_interval: 300
 request_timeout: 30
 log_default_lines: 200
 

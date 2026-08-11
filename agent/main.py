@@ -8,6 +8,7 @@ from .client import ControllerClient
 from .config import AgentConfig
 from .executor import JobExecutor
 from .inventory import collect_inventory
+from .discovery import OdooServiceDiscovery
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,9 +78,12 @@ def main():
         return
 
     executor = JobExecutor(config)
+    discovery = OdooServiceDiscovery(config)
     poll_interval = max(int(config.get("poll_interval") or 3), 1)
     heartbeat_interval = max(int(config.get("heartbeat_interval") or 30), 10)
     next_heartbeat = 0.0
+    service_sync_interval = max(int(config.get("service_sync_interval") or 300), 60,)
+    next_service_sync = 0.0
 
     while not STOP:
         now = time.monotonic()
@@ -88,6 +92,30 @@ def main():
             if now >= next_heartbeat:
                 client.heartbeat(collect_inventory(__version__))
                 next_heartbeat = now + heartbeat_interval
+
+            if now >= next_service_sync:
+                try:
+                    discovered = discovery.discover()
+
+                    result = client.sync_services(
+                        discovered.get("services") or []
+                    )
+
+                    _logger.info(
+                        "Sincronización automática Odoo: %s",
+                        result.get("message") or result,
+                    )
+
+                except Exception:
+                    _logger.exception(
+                        "No fue posible sincronizar automáticamente "
+                        "los servicios Odoo"
+                    )
+
+                finally:
+                    next_service_sync = (
+                        now + service_sync_interval
+                    )
 
             response = client.next_job()
             job = response.get("job")
