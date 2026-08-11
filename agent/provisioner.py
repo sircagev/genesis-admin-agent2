@@ -25,6 +25,9 @@ class OdooProvisioner:
 
     def owner_from_unit(self, unit):
         prefix = "odoo-server-"
+        unit = str(unit or "").strip()
+        if unit.endswith(".service"):
+            unit = unit[:-8]
         if not unit.startswith(prefix):
             raise CommandError("La unidad debe iniciar con odoo-server-")
         return assert_owner(unit[len(prefix):])
@@ -109,8 +112,13 @@ class OdooProvisioner:
             payload.get("logfile")
             or f"/var/log/odoo/odoo-server-{owner}.log"
         )
+        service_name = str(payload["service_name"]).strip()
+        if service_name.endswith(".service"):
+            systemd_unit = service_name
+        else:
+            systemd_unit = f"{service_name}.service"
         systemd_path = Path(
-            f"/etc/systemd/system/{payload['service_name']}.service"
+            f"/etc/systemd/system/{systemd_unit}"
         )
         nginx_path = Path(f"/etc/nginx/sites-available/{owner}.conf")
         nginx_link = Path(f"/etc/nginx/sites-enabled/{owner}.conf")
