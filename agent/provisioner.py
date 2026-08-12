@@ -4,6 +4,10 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
+import time
+import urllib.error
+import urllib.request
 
 from pathlib import Path
 
@@ -713,9 +717,7 @@ class OdooProvisioner:
         return None
 
     @staticmethod
-    def _read_odoo_config(
-        path
-    ):
+    def _read_odoo_config(path):
 
         parser = (
             configparser
@@ -727,17 +729,12 @@ class OdooProvisioner:
 
         try:
 
-            with Path(
-                path
-            ).open(
+            with Path(path).open(
                 "r",
                 encoding="utf-8",
                 errors="replace",
             ) as handle:
-
-                parser.read_file(
-                    handle
-                )
+                parser.read_file(handle)
 
         except (
             OSError,
@@ -762,11 +759,13 @@ class OdooProvisioner:
 
         keys = (
             "http_port",
+            "xmlrpc_port",
             "gevent_port",
             "longpolling_port",
             "workers",
             "max_cron_threads",
             "http_interface",
+            "xmlrpc_interface",
             "proxy_mode",
             "logfile",
             "log_level",
@@ -795,70 +794,35 @@ class OdooProvisioner:
     # CREAR INSTANCIA NUEVA
     # ---------------------------------------------------------
 
-    def create(
-        self,
-        raw_payload,
-    ):
+    def create(self, raw_payload):
 
-        prepared = self.prepare(
-            raw_payload
-        )
+        prepared = self.prepare(raw_payload)
 
-        if not prepared[
-            "success"
-        ]:
+        if not prepared["success"]:
 
             return {
-
-                "success":
-                    False,
-
-                "message":
-                    "Fallaron validaciones previas.",
-
+                "success": False,
+                "message": "Fallaron validaciones previas.",
                 **prepared,
             }
 
-        payload = (
-            prepared[
-                "normalized"
-            ]
-        )
+        payload = prepared["normalized"]
 
-        if payload.get(
-            "dry_run",
-            True,
-        ):
-
+        if payload.get("dry_run", True):
             return {
-
-                "success":
-                    True,
-
-                "dry_run":
-                    True,
-
+                "success":  True,
+                "dry_run":  True,
                 "message":
                     "Dry-run correcto; "
                     "no se realizaron cambios.",
-
-                "plan":
-                    self._plan(
-                        payload
-                    ),
+                "plan": self._plan(payload),
             }
 
-        owner = (
-            payload[
-                "owner"
-            ]
-        )
+        owner = payload["owner"]
 
         base_dir = (
             Path(
-                self.pcfg.get(
-                    "base_dir"
-                )
+                self.pcfg.get("base_dir")
                 or "/opt"
             )
             / owner
@@ -1340,34 +1304,497 @@ class OdooProvisioner:
             )
 
         return {
+            "success": True,
+            "dry_run": False,
+            "message": "Instancia Odoo base creada.",
+            "owner": owner,
+            "unit": payload["service_name"],
+            "base_dir": str(base_dir),
+            "config": str(conf_path),
+            "logfile": str(log_path),
+            "http_port": payload["http_port"],
+            "gevent_port": payload["gevent_port"],
+            "domain": payload["domain"],
+            "steps": steps,
+        }
 
-            "success":
-                True,
+    def finalize(self, raw_payload):
+        """
+        Finaliza una instancia ya creada:
 
-            "dry_run":
-                False,
+        1. Comprueba DNS público.
+        2. Espera si todavía no propagó.
+        3. Configura SSL.
+        4. Valida Nginx.
+        5. Hace health check.
+        """
 
-            "message":
-                "Instancia Odoo creada.",
+        payload = self.validate_payload(
+            raw_payload
+        )
 
-            "owner":
-                owner,
+        unit = payload[
+            "service_name"
+        ]
 
-            "unit":
+        # ---------------------------------------------------------
+        # VERIFICAR SYSTEMD
+        # ---------------------------------------------------------
+
+        if not systemd_exists(unit):
+            return {
+                "success": False,
+
+                "message":
+                    "La unidad systemd "
+                    "todavía no existe.",
+
+                "waiting_dns":
+                    False,
+
+                "status":
+                    systemd_status(
+                        unit
+                    ),
+            }
+
+        # ---------------------------------------------------------
+        # IP ESPERADA
+        # ---------------------------------------------------------
+
+        expected_ip = str(
+            payload.get(
+                "expected_ipv4"
+            )
+            or ""
+        ).strip()
+
+        # ---------------------------------------------------------
+        # DNS PÚBLICO
+        # ---------------------------------------------------------
+
+        resolved = (
+            self._resolve_ipv4(
                 payload[
-                    "service_name"
+                    "domain"
+                ]
+            )
+        )
+
+        # ---------------------------------------------------------
+        # TODAVÍA NO PROPAGÓ
+        # ---------------------------------------------------------
+
+        if (
+            expected_ip
+            and expected_ip
+            not in resolved
+        ):
+            return {
+                "success":
+                    True,
+
+                "waiting_dns":
+                    True,
+
+                "message": (
+                    "Instancia creada. "
+                    "Esperando propagación DNS: "
+                    f"{payload['domain']} "
+                    "debe resolver a "
+                    f"{expected_ip}."
+                ),
+
+                "dns_addresses":
+                    resolved,
+
+                "expected_ipv4":
+                    expected_ip,
+
+                "status":
+                    systemd_status(
+                        unit
+                    ),
+
+                "health":
+                    self._health(
+                        payload
+                    ),
+            }
+
+        steps = []
+
+        # ---------------------------------------------------------
+        # SSL
+        # ---------------------------------------------------------
+
+        if payload.get(
+            "create_ssl",
+            True,
+        ):
+            email = (
+                payload.get(
+                    "certbot_email"
+                )
+
+                or self.pcfg.get(
+                    "certbot_email"
+                )
+
+                or ""
+            ).strip()
+
+            if not email:
+                return {
+                    "success":
+                        False,
+
+                    "waiting_dns":
+                        False,
+
+                    "message": (
+                        "El DNS ya está listo, "
+                        "pero falta certbot_email "
+                        "para emitir el certificado."
+                    ),
+
+                    "dns_addresses":
+                        resolved,
+
+                    "status":
+                        systemd_status(
+                            unit
+                        ),
+                }
+
+            if (
+                shutil.which(
+                    "certbot"
+                )
+                is None
+            ):
+                return {
+                    "success":
+                        False,
+
+                    "waiting_dns":
+                        False,
+
+                    "message":
+                        "Certbot no está instalado.",
+
+                    "dns_addresses":
+                        resolved,
+                }
+
+            # -----------------------------------------------------
+            # CERTBOT
+            # -----------------------------------------------------
+
+            run(
+                [
+                    "certbot",
+                    "--nginx",
+
+                    "-d",
+                    payload[
+                        "domain"
+                    ],
+
+                    "--non-interactive",
+
+                    "--agree-tos",
+
+                    "--redirect",
+
+                    "-m",
+                    email,
+                ],
+                timeout=600,
+            )
+
+            # -----------------------------------------------------
+            # VALIDAR NGINX
+            # -----------------------------------------------------
+
+            run(
+                [
+                    "nginx",
+                    "-t",
+                ],
+                timeout=30,
+            )
+
+            run(
+                [
+                    "systemctl",
+                    "reload",
+                    "nginx",
+                ],
+                timeout=60,
+            )
+
+            steps.append(
+                "SSL configurado"
+            )
+
+        # ---------------------------------------------------------
+        # HEALTH CHECK
+        # ---------------------------------------------------------
+
+        health = self._health(
+            payload
+        )
+
+        checks = {
+            "service_active":
+                health[
+                    "service_active"
                 ],
 
-            "base_dir":
-                str(base_dir),
+            "http_listening":
+                health[
+                    "http_listening"
+                ],
 
-            "config":
-                str(conf_path),
+            "gevent_listening":
+                health[
+                    "gevent_listening"
+                ],
+
+            "odoo_http_responding":
+                health[
+                    "odoo_http_responding"
+                ],
+        }
+
+        failed = [
+            key
+
+            for key, value
+            in checks.items()
+
+            if not value
+        ]
+
+        return {
+            "success":
+                not failed,
+
+            "waiting_dns":
+                False,
+
+            "message": (
+                "Instancia Odoo creada "
+                "y verificada correctamente."
+
+                if not failed
+
+                else
+
+                "La instancia fue creada, "
+                "pero falló la verificación."
+            ),
+
+            "dns_addresses":
+                resolved,
+
+            "expected_ipv4":
+                expected_ip,
+
+            "checks":
+                checks,
+
+            "failed_checks":
+                failed,
+
+            "health":
+                health,
+
+            "status":
+                health[
+                    "status"
+                ],
 
             "steps":
                 steps,
         }
 
+
+    @staticmethod
+    def _resolve_ipv4(
+        domain,
+    ):
+        values = set()
+
+        try:
+            for item in (
+                socket.getaddrinfo(
+                    domain,
+                    None,
+                    family=socket.AF_INET,
+                    type=socket.SOCK_STREAM,
+                )
+            ):
+                if (
+                    item
+                    and item[4]
+                ):
+                    values.add(
+                        item[4][0]
+                    )
+
+        except socket.gaierror:
+            pass
+
+        return sorted(
+            values
+        )
+
+    def _health(
+        self,
+        payload,
+    ):
+        unit = payload[
+            "service_name"
+        ]
+
+        status = systemd_status(
+            unit
+        )
+
+        # ---------------------------------------------------------
+        # PUERTOS
+        # ---------------------------------------------------------
+
+        http_listening = (
+            not port_available(
+                payload[
+                    "http_port"
+                ]
+            )
+        )
+
+        gevent_listening = (
+            not port_available(
+                payload[
+                    "gevent_port"
+                ]
+            )
+        )
+
+        # ---------------------------------------------------------
+        # HTTP ODOO
+        # ---------------------------------------------------------
+
+        responding = False
+        http_status = 0
+        last_error = ""
+
+        url = (
+            "http://127.0.0.1:"
+            f"{payload['http_port']}"
+            "/web/login"
+        )
+
+        # ---------------------------------------------------------
+        # REINTENTAR CINCO VECES
+        # ---------------------------------------------------------
+
+        for _attempt in range(5):
+
+            try:
+                request = (
+                    urllib.request.Request(
+                        url,
+                        headers={
+                            "Host":
+                                payload[
+                                    "domain"
+                                ]
+                        },
+                    )
+                )
+
+                with (
+                    urllib.request
+                    .urlopen(
+                        request,
+                        timeout=5,
+                    )
+                ) as response:
+
+                    http_status = int(
+                        response.getcode()
+                        or 0
+                    )
+
+                    responding = (
+                        200
+                        <= http_status
+                        < 500
+                    )
+
+                    if responding:
+                        break
+
+            except urllib.error.HTTPError as exc:
+
+                http_status = int(
+                    exc.code
+                    or 0
+                )
+
+                responding = (
+                    200
+                    <= http_status
+                    < 500
+                )
+
+                last_error = str(
+                    exc
+                )
+
+                if responding:
+                    break
+
+            except Exception as exc:
+                # pylint: disable=broad-except
+
+                last_error = str(
+                    exc
+                )
+
+            time.sleep(
+                2
+            )
+
+        return {
+            "status":
+                status,
+
+            "service_active": (
+                status.get(
+                    "active_state"
+                )
+                == "active"
+            ),
+
+            "http_listening":
+                http_listening,
+
+            "gevent_listening":
+                gevent_listening,
+
+            "odoo_http_responding":
+                responding,
+
+            "http_status":
+                http_status,
+
+            "http_error":
+                last_error,
+        }
     # ---------------------------------------------------------
     # PLAN
     # ---------------------------------------------------------
@@ -1611,25 +2038,48 @@ class OdooProvisioner:
         addons,
         log_path,
     ):
+        version = str(
+            payload.get(
+                "version_odoo"
+            )
+            or "19"
+        )
 
-        return "\n".join(
-            [
-                "[options]",
+        interface = (
+            payload.get(
+                "http_interface"
+            )
+            or "127.0.0.1"
+        )
 
+        # ---------------------------------------------------------
+        # ODOO 17
+        # ---------------------------------------------------------
+
+        if version == "17":
+            port_lines = [
                 (
-                    "admin_passwd = "
-                    f"{secrets.token_urlsafe(32)}"
+                    "xmlrpc_port = "
+                    f"{payload['http_port']}"
                 ),
 
-                f"db_user = {owner}",
-
-                "db_password = False",
-
                 (
-                    "addons_path = "
-                    f"{','.join(addons)}"
+                    "longpolling_port = "
+                    f"{payload['gevent_port']}"
                 ),
 
+                (
+                    "xmlrpc_interface = "
+                    f"{interface}"
+                ),
+            ]
+
+        # ---------------------------------------------------------
+        # ODOO 18 / 19
+        # ---------------------------------------------------------
+
+        else:
+            port_lines = [
                 (
                     "http_port = "
                     f"{payload['http_port']}"
@@ -1641,6 +2091,39 @@ class OdooProvisioner:
                 ),
 
                 (
+                    "http_interface = "
+                    f"{interface}"
+                ),
+            ]
+
+        # ---------------------------------------------------------
+        # CONFIG
+        # ---------------------------------------------------------
+
+        return "\n".join(
+            [
+                "[options]",
+
+                (
+                    "admin_passwd = "
+                    f"{secrets.token_urlsafe(32)}"
+                ),
+
+                (
+                    "db_user = "
+                    f"{owner}"
+                ),
+
+                "db_password = False",
+
+                (
+                    "addons_path = "
+                    f"{','.join(addons)}"
+                ),
+
+                *port_lines,
+
+                (
                     "workers = "
                     f"{payload['workers']}"
                 ),
@@ -1648,11 +2131,6 @@ class OdooProvisioner:
                 (
                     "max_cron_threads = "
                     f"{payload['max_cron_threads']}"
-                ),
-
-                (
-                    "http_interface = "
-                    f"{payload.get('http_interface') or '127.0.0.1'}"
                 ),
 
                 (
@@ -1675,7 +2153,6 @@ class OdooProvisioner:
                 "",
             ]
         )
-
     # ---------------------------------------------------------
     # SYSTEMD
     # ---------------------------------------------------------
@@ -1690,23 +2167,23 @@ class OdooProvisioner:
     ):
 
         return f"""[Unit]
-Description=Odoo {owner}
-After=network.target postgresql.service
-Wants=postgresql.service
+            Description=Odoo {owner}
+            After=network.target postgresql.service
+            Wants=postgresql.service
 
-[Service]
-Type=simple
-User={owner}
-Group={owner}
-WorkingDirectory={odoo_dir}
-ExecStart={venv}/bin/python {odoo_dir}/odoo-bin -c {conf_path}
-Restart=always
-RestartSec=5
-LimitNOFILE=65536
+            [Service]
+            Type=simple
+            User={owner}
+            Group={owner}
+            WorkingDirectory={odoo_dir}
+            ExecStart={venv}/bin/python {odoo_dir}/odoo-bin -c {conf_path}
+            Restart=always
+            RestartSec=5
+            LimitNOFILE=65536
 
-[Install]
-WantedBy=multi-user.target
-"""
+            [Install]
+            WantedBy=multi-user.target
+        """
 
     # ---------------------------------------------------------
     # NGINX
@@ -1738,38 +2215,38 @@ WantedBy=multi-user.target
         )
 
         return f"""upstream {upstream} {{
-    server 127.0.0.1:{payload['http_port']};
-}}
+                server 127.0.0.1:{payload['http_port']};
+            }}
 
-upstream {chat} {{
-    server 127.0.0.1:{payload['gevent_port']};
-}}
+            upstream {chat} {{
+                server 127.0.0.1:{payload['gevent_port']};
+            }}
 
-server {{
-    listen 80;
-    server_name {domain};
+            server {{
+                listen 80;
+                server_name {domain};
 
-    proxy_read_timeout 720s;
-    proxy_connect_timeout 720s;
-    proxy_send_timeout 720s;
+                proxy_read_timeout 720s;
+                proxy_connect_timeout 720s;
+                proxy_send_timeout 720s;
 
-    proxy_set_header X-Forwarded-Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header Host $host;
+                proxy_set_header X-Forwarded-Host $host;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header Host $host;
 
-    location /websocket {{
-        proxy_pass http://{chat};
+                location /websocket {{
+                    proxy_pass http://{chat};
 
-        proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Upgrade $http_upgrade;
 
-        proxy_set_header Connection "upgrade";
-    }}
+                    proxy_set_header Connection "upgrade";
+                }}
 
-    location / {{
-        proxy_pass http://{upstream};
-        proxy_redirect off;
-    }}
-}}
-"""
+                location / {{
+                    proxy_pass http://{upstream};
+                    proxy_redirect off;
+                }}
+            }}
+            """
