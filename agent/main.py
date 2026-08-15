@@ -3,6 +3,8 @@ import signal
 import time
 import traceback
 
+import threading
+
 from . import __version__
 from .client import ControllerClient
 from .config import AgentConfig
@@ -117,6 +119,56 @@ def main():
                         now + service_sync_interval
                     )
 
+                try:
+                    database_inventory = (
+                        discovery
+                        .discover_databases(
+                            discovered.get(
+                                "services"
+                            )
+                            or []
+                        )
+                    )
+
+                    if database_inventory.get(
+                        "success"
+                    ):
+                        database_result = (
+                            client
+                            .sync_databases(
+                                database_inventory.get(
+                                    "databases"
+                                )
+                                or []
+                            )
+                        )
+
+                        _logger.info(
+                            "Sincronización automática "
+                            "PostgreSQL: %s",
+                            (
+                                database_result.get(
+                                    "message"
+                                )
+                                or database_result
+                            ),
+                        )
+
+                    else:
+                        _logger.warning(
+                            "Inventario PostgreSQL: %s",
+                            database_inventory.get(
+                                "message"
+                            ),
+                        )
+
+                except Exception:
+                    _logger.exception(
+                        "No fue posible sincronizar "
+                        "automáticamente las bases "
+                        "PostgreSQL"
+                    )
+
             response = client.next_job()
             job = response.get("job")
             if not job:
@@ -126,6 +178,84 @@ def main():
             job_id = job["id"]
             _logger.info("Trabajo %s: %s", job_id, job.get("job_type"))
             client.job_started(job_id)
+
+            progress_lock = threading.Lock()
+
+            progress_state = {
+                "stage": "running",
+                "percent": 1,
+                "message": "Trabajo iniciado.",
+            }
+
+            keepalive_stop = threading.Event()
+
+            def report_progress(
+                stage,
+                percent,
+                message,
+            ):
+                with progress_lock:
+                    progress_state["stage"] = str(
+                        stage or "running"
+                    )
+
+                    progress_state["percent"] = int(
+                        percent or 0
+                    )
+
+                    progress_state["message"] = str(
+                        message or ""
+                    )
+
+                try:
+                    client.job_progress(
+                        job_id,
+                        progress_state["stage"],
+                        progress_state["percent"],
+                        progress_state["message"],
+                    )
+
+                except Exception:
+                    _logger.warning(
+                        "No fue posible reportar progreso del trabajo %s",
+                        job_id,
+                        exc_info=True,
+                    )
+
+            def progress_keepalive():
+                while not keepalive_stop.wait(20):
+                    with progress_lock:
+                        stage = progress_state["stage"]
+                        percent = progress_state["percent"]
+                        message = progress_state["message"]
+
+                    try:
+                        client.job_progress(
+                            job_id,
+                            stage,
+                            percent,
+                            message,
+                        )
+
+                    except Exception:
+                        _logger.warning(
+                            "No fue posible enviar keepalive "
+                            "del trabajo %s",
+                            job_id,
+                            exc_info=True,
+                        )
+
+            executor.set_progress_callback(
+                report_progress
+            )
+
+            keepalive_thread = threading.Thread(
+                target=progress_keepalive,
+                name=f"job-{job_id}-keepalive",
+                daemon=True,
+            )
+
+            keepalive_thread.start()
 
             try:
                 result = executor.execute(job)
@@ -146,6 +276,17 @@ def main():
                     job_id,
                     False,
                     error=f"{exc}\n{traceback.format_exc(limit=8)}",
+                )
+            
+            finally:
+                keepalive_stop.set()
+
+                keepalive_thread.join(
+                    timeout=2
+                )
+
+                executor.set_progress_callback(
+                    None
                 )
 
         except Exception:  # pylint: disable=broad-except

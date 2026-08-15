@@ -6,17 +6,24 @@ from .commands import (
 )
 from .discovery import OdooServiceDiscovery
 from .provisioner import OdooProvisioner
+from .database_manager import DatabaseManager
 
 
 class JobExecutor:
     def __init__(self, config):
         self.config = config
+        self.progress_callback = None
+        
 
         self.provisioner = OdooProvisioner(
             config
         )
 
         self.discovery = OdooServiceDiscovery(
+            config
+        )
+
+        self.database_manager = DatabaseManager(
             config
         )
 
@@ -75,6 +82,15 @@ class JobExecutor:
 
             "provision.finalize":
                 self.provision_finalize,
+
+            "inventory.databases":
+                self.inventory_databases,
+
+            "database.backup":
+                self.database_backup,
+
+            "database.restore":
+                self.database_restore,
         }
 
         handler = handlers.get(
@@ -307,7 +323,8 @@ class JobExecutor:
         payload,
     ):
         return self.provisioner.create(
-            payload
+            payload,
+            progress_callback=self._progress,
         )
 
     # ---------------------------------------------------------
@@ -332,6 +349,11 @@ class JobExecutor:
         # -----------------------------------------------------
         # 1. BUSCAR PUERTOS
         # -----------------------------------------------------
+        self._progress(
+            "ports",
+            30,
+            "Buscando un par de puertos disponible...",
+        )
 
         port_result = (
             self.discovery
@@ -368,26 +390,26 @@ class JobExecutor:
                 "rango solicitado."
             )
 
+        self._progress(
+            "ports",
+            35,
+            (
+                "Puertos seleccionados: "
+                f"HTTP {pair['http_port']} / "
+                f"Gevent {pair['gevent_port']}."
+            ),
+        )
+
         # -----------------------------------------------------
         # 2. PAYLOAD DEFINITIVO
         # -----------------------------------------------------
 
         create_payload = {
             **payload,
-
             "http_port":
-                int(
-                    pair[
-                        "http_port"
-                    ]
-                ),
-
+                int(pair["http_port"]),
             "gevent_port":
-                int(
-                    pair[
-                        "gevent_port"
-                    ]
-                ),
+                int(pair["gevent_port"]),
 
             # SSL NO se hace todavía.
             #
@@ -397,11 +419,8 @@ class JobExecutor:
             # Nginx
             #
             # Luego verificamos DNS público.
-            "create_ssl":
-                False,
-
-            "dry_run":
-                False,
+            "create_ssl": False,
+            "dry_run": False,
         }
 
         # -----------------------------------------------------
@@ -409,43 +428,23 @@ class JobExecutor:
         # -----------------------------------------------------
 
         created = (
-            self.provisioner
-            .create(
-                create_payload
+            self.provisioner.create(
+                create_payload,
+                progress_callback=self._progress,
             )
         )
 
-        created[
-            "assigned_ports"
-        ] = {
-            "http_port":
-                create_payload[
-                    "http_port"
-                ],
-
-            "gevent_port":
-                create_payload[
-                    "gevent_port"
-                ],
+        created["assigned_ports"] = {
+            "http_port": create_payload["http_port"],
+            "gevent_port": create_payload["gevent_port"],
         }
 
-        created[
-            "port_scan"
-        ] = {
-            "scan_start":
-                port_result.get(
-                    "scan_start"
-                ),
-
-            "scan_end":
-                port_result.get(
-                    "scan_end"
-                ),
+        created["port_scan"] = {
+            "scan_start": port_result.get("scan_start"),
+            "scan_end": port_result.get("scan_end"),
         }
 
-        if not created.get(
-            "success"
-        ):
+        if not created.get("success"):
             return created
 
         # -----------------------------------------------------
@@ -457,22 +456,15 @@ class JobExecutor:
 
             "create_ssl":
                 bool(
-                    payload.get(
-                        "create_ssl",
-                        True,
-                    )
+                    payload.get("create_ssl", True)
                 ),
 
             "certbot_email":
-                payload.get(
-                    "certbot_email"
-                )
+                payload.get("certbot_email")
                 or "",
 
             "expected_ipv4":
-                payload.get(
-                    "expected_ipv4"
-                )
+                payload.get("expected_ipv4")
                 or "",
         }
 
@@ -480,20 +472,14 @@ class JobExecutor:
         # 5. DNS + SSL + HEALTH
         # -----------------------------------------------------
 
-        finalized = (
-            self.provisioner
-            .finalize(
-                finalize_payload
-            )
-        )
+        finalized = self.provisioner.finalize(
+                        finalize_payload,
+                        progress_callback=self._progress,
+                    )
 
-        created[
-            "finalize"
-        ] = finalized
+        created["finalize"] = finalized
 
-        created[
-            "waiting_dns"
-        ] = bool(
+        created["waiting_dns"] = bool(
             finalized.get(
                 "waiting_dns"
             )
@@ -618,9 +604,72 @@ class JobExecutor:
             payload
         )
 
+        return self.provisioner.finalize(
+            payload,
+            progress_callback=self._progress,
+        )
+
+    def set_progress_callback(
+        self,
+        callback,
+    ):
+        self.progress_callback = callback
+
+
+    def _progress(
+        self,
+        stage,
+        percent,
+        message,
+    ):
+        callback = self.progress_callback
+
+        if callback:
+            callback(
+                stage,
+                percent,
+                message,
+            )
+
+    # =========================================================
+    # BASES DE DATOS
+    # =========================================================
+
+    def inventory_databases(
+        self,
+        payload,
+    ):
         return (
-            self.provisioner
-            .finalize(
+            self.discovery
+            .discover_databases()
+        )
+
+    def database_backup(
+        self,
+        payload,
+    ):
+        self._allowed_unit(
+            payload
+        )
+
+        return (
+            self.database_manager
+            .backup(
+                payload
+            )
+        )
+
+    def database_restore(
+        self,
+        payload,
+    ):
+        self._allowed_unit(
+            payload
+        )
+
+        return (
+            self.database_manager
+            .restore(
                 payload
             )
         )

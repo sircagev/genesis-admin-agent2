@@ -28,6 +28,9 @@ DOMAIN_RE = re.compile(
     r"[A-Za-z]{2,63}$"
 )
 
+ODOO_SYSTEM_USER = "odoo"
+ODOO_SYSTEM_GROUP = "odoo"
+
 
 class OdooProvisioner:
 
@@ -52,6 +55,53 @@ class OdooProvisioner:
             return unit
 
         return f"{unit}.service"
+
+    def _run_certbot_with_retry(self, domain, email):
+        delays = [0, 5, 10, 15]
+        last_error = None
+
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                time.sleep(delay)
+
+            try:
+                run(
+                    [
+                        "certbot",
+                        "--nginx",
+                        "-d",
+                        domain,
+                        "--non-interactive",
+                        "--agree-tos",
+                        "--redirect",
+                        "-m",
+                        email,
+                    ],
+                    timeout=600,
+                )
+
+                return {
+                    "success": True,
+                    "attempts": attempt,
+                }
+
+            except CommandError as exc:
+                last_error = exc
+                message = str(exc).lower()
+
+                transient = (
+                    "another instance of certbot is already running" in message
+                    or "certbot.lock" in message
+                    or "lock file" in message
+                )
+
+                if not transient:
+                    raise
+
+                if attempt >= len(delays):
+                    raise
+
+        raise last_error
 
     def owner_from_unit(self, unit):
         prefix = "odoo-server-"
@@ -116,6 +166,24 @@ class OdooProvisioner:
                 f"Dominio inválido: {domain!r}"
             )
 
+        database_name = str(
+            payload.get("database_name")
+            or ""
+        ).strip().lower()
+
+        if (
+            database_name
+            and not re.fullmatch(
+                r"[a-z][a-z0-9_]{0,62}",
+                database_name,
+            )
+        ):
+            raise CommandError(
+                "database_name debe iniciar con una letra "
+                "y usar solamente minúsculas, números "
+                "y guiones bajos."
+            )
+
         return {
             **payload,
 
@@ -142,6 +210,8 @@ class OdooProvisioner:
             ),
 
             "domain": domain,
+
+            "database_name": database_name,
         }
 
     # ---------------------------------------------------------
@@ -186,6 +256,21 @@ class OdooProvisioner:
                         "psql",
                         "-Atc",
                         "SELECT 1;",
+                    ],
+                    check=False,
+                )["success"],
+
+            "odoo_system_user_exists":
+                self._linux_user_exists(
+                    ODOO_SYSTEM_USER
+                ),
+
+            "odoo_system_group_exists":
+                run(
+                    [
+                        "getent",
+                        "group",
+                        ODOO_SYSTEM_GROUP,
                     ],
                     check=False,
                 )["success"],
@@ -771,6 +856,9 @@ class OdooProvisioner:
             "log_level",
             "addons_path",
             "db_user",
+            "db_name",
+            "dbfilter",
+            "data_dir",
         )
 
         return {
@@ -794,7 +882,23 @@ class OdooProvisioner:
     # CREAR INSTANCIA NUEVA
     # ---------------------------------------------------------
 
-    def create(self, raw_payload):
+    def create(
+        self,
+        raw_payload,
+        progress_callback=None,
+    ):
+
+        def progress(
+            stage,
+            percent,
+            message,
+        ):
+            if callable(progress_callback):
+                progress_callback(
+                    stage,
+                    percent,
+                    message,
+                )
 
         prepared = self.prepare(raw_payload)
 
@@ -847,14 +951,12 @@ class OdooProvisioner:
         )
 
         conf_path = Path(
-            f"/etc/odoo-{owner}.conf"
+            f"/etc/odoo{owner}.conf"
         )
 
         log_path = Path(
 
-            payload.get(
-                "logfile"
-            )
+            payload.get("logfile")
 
             or
 
@@ -881,31 +983,6 @@ class OdooProvisioner:
 
         steps = []
 
-        # -----------------------------------------------------
-        # LINUX USER
-        # -----------------------------------------------------
-
-        if not self._linux_user_exists(
-            owner
-        ):
-
-            run(
-                [
-                    "useradd",
-                    "--system",
-                    "--create-home",
-                    "--home-dir",
-                    str(base_dir),
-                    "--shell",
-                    "/bin/bash",
-                    owner,
-                ]
-            )
-
-            steps.append(
-                "Usuario Linux creado"
-            )
-
         base_dir.mkdir(
             parents=True,
             exist_ok=True,
@@ -914,6 +991,12 @@ class OdooProvisioner:
         # -----------------------------------------------------
         # ODOO
         # -----------------------------------------------------
+
+        progress(
+            "clone",
+            40,
+            "Preparando código fuente de Odoo...",
+        )
 
         if not (
             odoo_dir
@@ -950,9 +1033,21 @@ class OdooProvisioner:
                 "Odoo clonado"
             )
 
+        progress(
+            "clone",
+            46,
+            "Código fuente de Odoo disponible.",
+        )
+
         # -----------------------------------------------------
         # VENV
         # -----------------------------------------------------
+
+        progress(
+            "dependencies",
+            50,
+            "Preparando entorno virtual y dependencias...",
+        )
 
         if not venv.exists():
 
@@ -1001,6 +1096,12 @@ class OdooProvisioner:
                 "requirements instalados"
             )
 
+            progress(
+                "dependencies",
+                58,
+                "Dependencias de Odoo instaladas.",
+            )
+
         # -----------------------------------------------------
         # CUSTOM MODULES
         # -----------------------------------------------------
@@ -1045,6 +1146,12 @@ class OdooProvisioner:
         # -----------------------------------------------------
         # POSTGRES
         # -----------------------------------------------------
+
+        progress(
+            "postgres",
+            62,
+            "Preparando rol PostgreSQL...",
+        )
 
         self._ensure_postgres_role(
             owner
@@ -1110,6 +1217,12 @@ class OdooProvisioner:
         # ODOO.CONF
         # -----------------------------------------------------
 
+        progress(
+            "config",
+            68,
+            "Generando configuración de Odoo...",
+        )
+
         conf_path.write_text(
             self._odoo_conf(
                 payload,
@@ -1148,6 +1261,12 @@ class OdooProvisioner:
         # -----------------------------------------------------
         # NGINX
         # -----------------------------------------------------
+
+        progress(
+            "nginx",
+            75,
+            "Configurando Nginx...",
+        )
 
         if payload.get(
             "create_nginx",
@@ -1191,11 +1310,17 @@ class OdooProvisioner:
         # OWNERSHIP
         # -----------------------------------------------------
 
+        progress(
+            "service",
+            78,
+            "Aplicando permisos del servicio...",
+        )
+
         run(
             [
                 "chown",
                 "-R",
-                f"{owner}:{owner}",
+                f"{ODOO_SYSTEM_USER}:{ODOO_SYSTEM_GROUP}",
                 str(base_dir),
             ]
         )
@@ -1203,9 +1328,26 @@ class OdooProvisioner:
         run(
             [
                 "chown",
-                f"{owner}:{owner}",
+                f"{ODOO_SYSTEM_USER}:{ODOO_SYSTEM_GROUP}",
                 str(log_path),
             ]
+        )
+
+        run(
+            [
+                "chown",
+                f"{ODOO_SYSTEM_USER}:{ODOO_SYSTEM_GROUP}",
+                str(conf_path),
+            ]
+        )
+
+        os.chmod(
+            conf_path,
+            0o640,
+        )
+
+        steps.append(
+            "Permisos asignados a odoo:odoo"
         )
 
         # -----------------------------------------------------
@@ -1248,6 +1390,12 @@ class OdooProvisioner:
             steps.append(
                 "Servicio Odoo iniciado"
             )
+
+        progress(
+            "service",
+            82,
+            "Servicio Odoo iniciado.",
+        )
 
         # -----------------------------------------------------
         # SSL
@@ -1318,7 +1466,7 @@ class OdooProvisioner:
             "steps": steps,
         }
 
-    def finalize(self, raw_payload):
+    def finalize(self, raw_payload, progress_callback=None):
         """
         Finaliza una instancia ya creada:
 
@@ -1328,6 +1476,17 @@ class OdooProvisioner:
         4. Valida Nginx.
         5. Hace health check.
         """
+        def progress(
+            stage,
+            percent,
+            message,
+        ):
+            if callable(progress_callback):
+                progress_callback(
+                    stage,
+                    percent,
+                    message,
+                )
 
         payload = self.validate_payload(
             raw_payload
@@ -1372,6 +1531,12 @@ class OdooProvisioner:
         # ---------------------------------------------------------
         # DNS PÚBLICO
         # ---------------------------------------------------------
+
+        progress(
+            "waiting_dns",
+            85,
+            "Comprobando propagación DNS...",
+        )
 
         resolved = (
             self._resolve_ipv4(
@@ -1491,26 +1656,26 @@ class OdooProvisioner:
             # CERTBOT
             # -----------------------------------------------------
 
-            run(
-                [
-                    "certbot",
-                    "--nginx",
+            progress(
+                "ssl",
+                90,
+                "Configurando certificado SSL...",
+            )
 
-                    "-d",
-                    payload[
-                        "domain"
-                    ],
+            certbot_result = self._run_certbot_with_retry(
+                payload["domain"],
+                email,
+            )
 
-                    "--non-interactive",
+            steps.append(
+                f"SSL configurado con Certbot "
+                f"(intentos: {certbot_result['attempts']})"
+            )
 
-                    "--agree-tos",
-
-                    "--redirect",
-
-                    "-m",
-                    email,
-                ],
-                timeout=600,
+            progress(
+                "ssl",
+                94,
+                "Certificado SSL configurado.",
             )
 
             # -----------------------------------------------------
@@ -1534,13 +1699,16 @@ class OdooProvisioner:
                 timeout=60,
             )
 
-            steps.append(
-                "SSL configurado"
-            )
 
         # ---------------------------------------------------------
         # HEALTH CHECK
         # ---------------------------------------------------------
+
+        progress(
+            "health",
+            97,
+            "Verificando servicio, puertos y HTTP...",
+        )
 
         health = self._health(
             payload
@@ -1576,6 +1744,13 @@ class OdooProvisioner:
 
             if not value
         ]
+
+        if not failed:
+            progress(
+                "finished",
+                100,
+                "Instancia creada y verificada correctamente.",
+            )
 
         return {
             "success":
@@ -2100,6 +2275,18 @@ class OdooProvisioner:
         # CONFIG
         # ---------------------------------------------------------
 
+        database_name = str(
+            payload.get("database_name")
+            or ""
+        ).strip()
+
+        database_lines = []
+
+        if database_name:
+            database_lines.append(
+                f"dbfilter = ^{database_name}$"
+            )
+
         return "\n".join(
             [
                 "[options]",
@@ -2115,6 +2302,8 @@ class OdooProvisioner:
                 ),
 
                 "db_password = False",
+
+                *database_lines,
 
                 (
                     "addons_path = "
@@ -2173,8 +2362,8 @@ class OdooProvisioner:
 
             [Service]
             Type=simple
-            User={owner}
-            Group={owner}
+            User={ODOO_SYSTEM_USER}
+            Group={ODOO_SYSTEM_GROUP}
             WorkingDirectory={odoo_dir}
             ExecStart={venv}/bin/python {odoo_dir}/odoo-bin -c {conf_path}
             Restart=always
