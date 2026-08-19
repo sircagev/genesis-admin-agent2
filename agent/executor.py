@@ -7,6 +7,7 @@ from .commands import (
 from .discovery import OdooServiceDiscovery
 from .provisioner import OdooProvisioner
 from .database_manager import DatabaseManager
+from .bootstrap import ServerBootstrapAuditor
 
 
 class JobExecutor:
@@ -27,6 +28,10 @@ class JobExecutor:
             config
         )
 
+        self.bootstrap_auditor = ServerBootstrapAuditor(
+            progress_callback=self._progress
+        )
+
         self.allowed_exact = set(
             config.get("allowed_exact")
             or []
@@ -41,6 +46,15 @@ class JobExecutor:
             config.get("log_default_lines")
             or 200
         )
+
+    def set_runtime_config(self, values):
+        values = values if isinstance(values, dict) else {}
+        self.provisioner.set_runtime_config(values)
+        self.database_manager.set_runtime_config(values)
+
+    def clear_runtime_config(self):
+        self.provisioner.clear_runtime_config()
+        self.database_manager.clear_runtime_config()
 
     def execute(self, job):
         job_type = job.get("job_type")
@@ -67,6 +81,9 @@ class JobExecutor:
 
             "inventory.ports":
                 self.inventory_ports,
+
+            "bootstrap.audit":
+                self.bootstrap_audit,
 
             "provision.prepare":
                 self.provision_prepare,
@@ -262,7 +279,21 @@ class JobExecutor:
         self,
         _payload,
     ):
-        return self.discovery.discover()
+        self._progress("agent", 10, "Agent consultado.")
+        self._progress(
+            "systemd", 20, "Descubriendo unidades systemd de Odoo."
+        )
+        self._progress("configs", 35, "Leyendo configuraciones Odoo.")
+        self._progress(
+            "nginx", 50, "Detectando Nginx y dominios asociados."
+        )
+        result = self.discovery.discover()
+        self._progress(
+            "synchronizing",
+            70,
+            "Inventario detectado; enviando servicios al Controller.",
+        )
+        return result
 
     # ---------------------------------------------------------
     # PUERTOS
@@ -297,6 +328,9 @@ class JobExecutor:
                 ),
             )
         )
+
+    def bootstrap_audit(self, payload):
+        return self.bootstrap_auditor.audit(payload)
 
     # ---------------------------------------------------------
     # APROVISIONAMIENTO EXISTENTE
@@ -351,7 +385,7 @@ class JobExecutor:
         # -----------------------------------------------------
         self._progress(
             "ports",
-            30,
+            15,
             "Buscando un par de puertos disponible...",
         )
 
@@ -392,7 +426,7 @@ class JobExecutor:
 
         self._progress(
             "ports",
-            35,
+            18,
             (
                 "Puertos seleccionados: "
                 f"HTTP {pair['http_port']} / "
@@ -639,10 +673,28 @@ class JobExecutor:
         self,
         payload,
     ):
-        return (
-            self.discovery
-            .discover_databases()
+        self._progress("agent", 10, "Agent consultado.")
+        self._progress(
+            "postgresql", 25, "Leyendo el inventario PostgreSQL."
         )
+        services = self.discovery.discover().get("services") or []
+        result = self.discovery.discover_databases(services=services)
+        self._progress("detecting", 40, "Detectando bases PostgreSQL.")
+        self._progress("owner", 50, "Leyendo owners PostgreSQL.")
+        self._progress(
+            "configs", 55, "Leyendo configuraciones Odoo."
+        )
+        self._progress(
+            "associating",
+            65,
+            "Asociando bases de datos con servicios Odoo.",
+        )
+        self._progress(
+            "updating",
+            75,
+            "Inventario detectado; enviando bases al Controller.",
+        )
+        return result
 
     def database_backup(
         self,
@@ -655,7 +707,8 @@ class JobExecutor:
         return (
             self.database_manager
             .backup(
-                payload
+                payload,
+                progress_callback=self._progress,
             )
         )
 
@@ -670,6 +723,7 @@ class JobExecutor:
         return (
             self.database_manager
             .restore(
-                payload
+                payload,
+                progress_callback=self._progress,
             )
         )

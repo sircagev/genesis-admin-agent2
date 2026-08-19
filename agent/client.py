@@ -155,6 +155,12 @@ class ControllerClient:
             },
         )
 
+    def provisioning_config(self):
+        return self._post(
+            "/infra/agent/v1/config/provisioning",
+            {},
+        )
+
     def next_job(self):
         return self._post(
             "/infra/agent/v1/jobs/next",

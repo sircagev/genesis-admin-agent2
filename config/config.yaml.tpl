@@ -23,8 +23,16 @@ allowed_prefix:
 provision:
   base_dir: "/opt"
   odoo_repo: "https://github.com/odoo/odoo.git"
-  custom_addons_repo: ""
+  odoo_branch: "19.0"
+  admin_passwd: "genesispos"
+  postgres_host: "127.0.0.1"
+  postgres_port: 5432
+  postgres_default_password: "odoo"
+  postgres_validate_auth: true
+  custom_addons_repo: "https://github.com/evopos30/modulosFE19.git"
   custom_addons_branch: ""
+  github_auth_enabled: false
+  github_username: ""
   custom_addons_subpaths:
     - "custom_addons"
     - "modulos"

@@ -258,6 +258,16 @@ def main():
             keepalive_thread.start()
 
             try:
+                if job.get("job_type") in (
+                    "provision.prepare",
+                    "provision.create",
+                    "provision.auto_create",
+                    "provision.finalize",
+                    "database.restore",
+                ):
+                    runtime = client.provisioning_config()
+                    executor.set_runtime_config(runtime.get("config") or {})
+
                 result = executor.execute(job)
                 success = bool(result.get("success", True))
                 client.job_result(
@@ -284,6 +294,8 @@ def main():
                 keepalive_thread.join(
                     timeout=2
                 )
+
+                executor.clear_runtime_config()
 
                 executor.set_progress_callback(
                     None

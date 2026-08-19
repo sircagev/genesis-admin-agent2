@@ -5,11 +5,15 @@ import secrets
 import shlex
 import shutil
 import socket
+import stat
+import subprocess
 import time
+import tempfile
 import urllib.error
 import urllib.request
 
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .commands import (
     CommandError,
@@ -30,13 +34,38 @@ DOMAIN_RE = re.compile(
 
 ODOO_SYSTEM_USER = "odoo"
 ODOO_SYSTEM_GROUP = "odoo"
+GITHUB_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,255}$")
 
 
 class OdooProvisioner:
 
     def __init__(self, config):
         self.config = config
-        self.pcfg = config.section("provision")
+        self.base_pcfg = dict(config.section("provision"))
+        self.pcfg = dict(self.base_pcfg)
+
+    def set_runtime_config(self, values):
+        self.pcfg = dict(self.base_pcfg)
+        allowed = {
+            "postgres_host",
+            "postgres_port",
+            "postgres_default_password",
+            "postgres_validate_auth",
+            "odoo_repo",
+            "odoo_branch",
+            "admin_passwd",
+            "custom_addons_repo",
+            "custom_addons_branch",
+            "github_auth_enabled",
+            "github_username",
+            "github_token",
+        }
+        for key, value in (values or {}).items():
+            if key in allowed:
+                self.pcfg[key] = value
+
+    def clear_runtime_config(self):
+        self.pcfg = dict(self.base_pcfg)
 
     # ---------------------------------------------------------
     # NORMALIZACIÓN
@@ -855,7 +884,11 @@ class OdooProvisioner:
             "logfile",
             "log_level",
             "addons_path",
+            "admin_passwd",
+            "db_host",
+            "db_port",
             "db_user",
+            "db_password",
             "db_name",
             "dbfilter",
             "data_dir",
@@ -887,23 +920,13 @@ class OdooProvisioner:
         raw_payload,
         progress_callback=None,
     ):
-
-        def progress(
-            stage,
-            percent,
-            message,
-        ):
+        def progress(stage, percent, message):
             if callable(progress_callback):
-                progress_callback(
-                    stage,
-                    percent,
-                    message,
-                )
+                progress_callback(stage, percent, message)
 
+        progress("ports", 18, "Validando puertos y prerrequisitos...")
         prepared = self.prepare(raw_payload)
-
         if not prepared["success"]:
-
             return {
                 "success": False,
                 "message": "Fallaron validaciones previas.",
@@ -911,545 +934,139 @@ class OdooProvisioner:
             }
 
         payload = prepared["normalized"]
-
         if payload.get("dry_run", True):
             return {
-                "success":  True,
-                "dry_run":  True,
-                "message":
-                    "Dry-run correcto; "
-                    "no se realizaron cambios.",
+                "success": True,
+                "dry_run": True,
+                "message": "Dry-run correcto; no se realizaron cambios.",
                 "plan": self._plan(payload),
             }
 
         owner = payload["owner"]
+        base_root = Path(self.pcfg.get("base_dir") or "/opt").resolve()
+        base_dir = (base_root / owner).resolve()
+        if base_dir.parent != base_root:
+            raise CommandError("Ruta de instancia no permitida.")
 
-        base_dir = (
-            Path(
-                self.pcfg.get("base_dir")
-                or "/opt"
-            )
-            / owner
-        )
-
-        odoo_dir = (
-            base_dir
-            / "odoo-server"
-        )
-
-        venv = (
-            odoo_dir
-            / "venv"
-        )
-
-        custom_dir = (
-            odoo_dir
-            / (
-                "modulosFE"
-                f"{payload['version_odoo']}"
-            )
-        )
-
-        conf_path = Path(
-            f"/etc/odoo{owner}.conf"
-        )
-
+        odoo_dir = base_dir / "odoo-server"
+        venv = odoo_dir / f"{owner}venv"
+        custom_dir = odoo_dir / f"modulosFE{payload['version_odoo']}"
+        conf_path = Path(f"/etc/odoo{owner}.conf")
         log_path = Path(
-
             payload.get("logfile")
-
-            or
-
-            f"/var/log/odoo/"
-            f"odoo-server-{owner}.log"
+            or f"/var/log/odoo/odoo-server-{owner}.log"
         )
-
         systemd_path = Path(
-            "/etc/systemd/system/"
-            f"{payload['service_name']}"
+            f"/etc/systemd/system/{payload['service_name']}"
         )
-
-        nginx_path = Path(
-            "/etc/nginx/"
-            "sites-available/"
-            f"{owner}.conf"
-        )
-
-        nginx_link = Path(
-            "/etc/nginx/"
-            "sites-enabled/"
-            f"{owner}.conf"
-        )
-
+        nginx_path = Path(f"/etc/nginx/sites-available/{owner}.conf")
+        nginx_link = Path(f"/etc/nginx/sites-enabled/{owner}.conf")
         steps = []
 
-        base_dir.mkdir(
-            parents=True,
-            exist_ok=True,
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        progress("clone", 22, "Clonando o validando Odoo upstream...")
+        odoo_created = self._prepare_odoo_tree(
+            odoo_dir,
+            base_dir,
+            str(self.pcfg.get("odoo_repo") or "https://github.com/odoo/odoo.git"),
+            str(self.pcfg.get("odoo_branch") or f"{payload['version_odoo']}.0"),
         )
+        steps.append("Odoo clonado" if odoo_created else "Odoo existente validado")
 
-        # -----------------------------------------------------
-        # ODOO
-        # -----------------------------------------------------
+        custom_repo = str(self.pcfg.get("custom_addons_repo") or "").strip()
+        if custom_repo:
+            if self._as_bool(self.pcfg.get("github_auth_enabled"), False):
+                progress("github_auth", 26, "Autenticando temporalmente con GitHub...")
+            progress("custom_repo", 27, "Preparando repositorio de módulos custom...")
+            custom_action = self._prepare_custom_repo(custom_repo, custom_dir)
+            progress("custom_addons", 29, "Preparando rutas de addons custom...")
+            steps.append(custom_action)
 
-        progress(
-            "clone",
-            40,
-            "Preparando código fuente de Odoo...",
-        )
-
-        if not (
-            odoo_dir
-            / ".git"
-        ).exists():
-
-            run(
-                [
-                    "git",
-                    "clone",
-                    "--depth",
-                    "1",
-                    "--branch",
-                    (
-                        f"{payload['version_odoo']}"
-                        ".0"
-                    ),
-                    (
-                        self.pcfg.get(
-                            "odoo_repo"
-                        )
-                        or
-                        "https://github.com/"
-                        "odoo/odoo.git"
-                    ),
-                    str(
-                        odoo_dir
-                    ),
-                ],
-                timeout=1800,
-            )
-
-            steps.append(
-                "Odoo clonado"
-            )
-
-        progress(
-            "clone",
-            46,
-            "Código fuente de Odoo disponible.",
-        )
-
-        # -----------------------------------------------------
-        # VENV
-        # -----------------------------------------------------
-
-        progress(
-            "dependencies",
-            50,
-            "Preparando entorno virtual y dependencias...",
-        )
-
+        progress("venv", 31, "Preparando entorno virtual de la instancia...")
         if not venv.exists():
+            run(["python3", "-m", "venv", str(venv)], timeout=120)
+        pip = str(venv / "bin/pip")
+        run([pip, "install", "--upgrade", "pip", "wheel"], timeout=600)
 
-            run(
-                [
-                    "python3",
-                    "-m",
-                    "venv",
-                    str(venv),
-                ],
-                timeout=120,
-            )
+        progress("requirements", 35, "Instalando requirements base de Odoo...")
+        run([pip, "install", "-r", str(odoo_dir / "requirements.txt")], timeout=1800)
+        custom_requirements = custom_dir / "requirements.txt"
+        if custom_requirements.is_file():
+            progress("custom_requirements", 37, "Instalando requirements custom...")
+            run([pip, "install", "-r", str(custom_requirements)], timeout=1800)
+        steps.append("Virtualenv y requirements instalados")
 
-            run(
-                [
-                    str(
-                        venv
-                        / "bin/pip"
-                    ),
-                    "install",
-                    "--upgrade",
-                    "pip",
-                    "wheel",
-                ],
-                timeout=600,
-            )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.touch(exist_ok=True)
 
-            run(
-                [
-                    str(
-                        venv
-                        / "bin/pip"
-                    ),
-                    "install",
-                    "-r",
-                    str(
-                        odoo_dir
-                        / "requirements.txt"
-                    ),
-                ],
-                timeout=1800,
-            )
-
-            steps.append(
-                "Virtualenv y "
-                "requirements instalados"
-            )
-
-            progress(
-                "dependencies",
-                58,
-                "Dependencias de Odoo instaladas.",
-            )
-
-        # -----------------------------------------------------
-        # CUSTOM MODULES
-        # -----------------------------------------------------
-
-        custom_repo = (
-            self.pcfg.get(
-                "custom_addons_repo"
-            )
-            or ""
-        ).strip()
-
-        if (
-            custom_repo
-            and not (
-                custom_dir
-                / ".git"
-            ).exists()
-        ):
-
-            self._clone_custom_repo(
-                custom_repo,
-                custom_dir,
-            )
-
-            steps.append(
-                "Repositorio de módulos clonado"
-            )
-
-        # -----------------------------------------------------
-        # LOG
-        # -----------------------------------------------------
-
-        log_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        log_path.touch(
-            exist_ok=True
-        )
-
-        # -----------------------------------------------------
-        # POSTGRES
-        # -----------------------------------------------------
-
-        progress(
-            "postgres",
-            62,
-            "Preparando rol PostgreSQL...",
-        )
-
-        self._ensure_postgres_role(
-            owner
-        )
-
-        steps.append(
-            "Rol PostgreSQL verificado"
-        )
-
-        # -----------------------------------------------------
-        # ADDONS
-        # -----------------------------------------------------
+        progress("postgres", 42, "Configurando rol PostgreSQL...")
+        self._ensure_postgres_role(owner)
+        if self._as_bool(self.pcfg.get("postgres_validate_auth"), True):
+            progress("postgres_auth", 46, "Validando autenticación TCP PostgreSQL...")
+            self._validate_postgres_auth(owner, "postgres")
+        steps.append("Rol y autenticación PostgreSQL verificados")
 
         addons = [
-
-            str(
-                odoo_dir
-                / "odoo/addons"
-            ),
-
-            str(
-                odoo_dir
-                / "addons"
-            ),
+            str(odoo_dir / "addons"),
+            str(custom_dir / "custom_addons"),
+            str(custom_dir / "modulos"),
         ]
 
-        if custom_dir.exists():
-
-            subpaths = (
-                self.pcfg.get(
-                    "custom_addons_subpaths"
-                )
-                or [
-                    "custom_addons",
-                    "modulos",
-                ]
-            )
-
-            found_custom = False
-
-            for subpath in subpaths:
-
-                candidate = (
-                    custom_dir
-                    / str(subpath)
-                )
-
-                if candidate.exists():
-
-                    addons.append(
-                        str(candidate)
-                    )
-
-                    found_custom = True
-
-            if not found_custom:
-
-                addons.append(
-                    str(custom_dir)
-                )
-
-        # -----------------------------------------------------
-        # ODOO.CONF
-        # -----------------------------------------------------
-
-        progress(
-            "config",
-            68,
-            "Generando configuración de Odoo...",
-        )
-
+        progress("config", 50, "Generando y validando configuración de Odoo...")
         conf_path.write_text(
-            self._odoo_conf(
-                payload,
-                owner,
-                addons,
-                log_path,
-            ),
+            self._odoo_conf(payload, owner, addons, log_path),
             encoding="utf-8",
         )
-
-        os.chmod(
-            conf_path,
-            0o640,
-        )
-
-        # -----------------------------------------------------
-        # SYSTEMD
-        # -----------------------------------------------------
+        os.chmod(conf_path, 0o640)
+        self._validate_odoo_conf(conf_path, payload)
 
         systemd_path.write_text(
             self._systemd_unit(
-                payload,
-                owner,
-                odoo_dir,
-                venv,
-                conf_path,
+                payload, owner, odoo_dir, venv, conf_path
             ),
             encoding="utf-8",
         )
+        steps.append("Configuración Odoo validada y systemd creado")
 
-        steps.append(
-            "Configuración Odoo "
-            "y systemd creadas"
-        )
-
-        # -----------------------------------------------------
-        # NGINX
-        # -----------------------------------------------------
-
-        progress(
-            "nginx",
-            75,
-            "Configurando Nginx...",
-        )
-
-        if payload.get(
-            "create_nginx",
-            True,
-        ):
-
+        progress("nginx", 55, "Configurando Nginx...")
+        if payload.get("create_nginx", True):
             nginx_path.write_text(
-                self._nginx_conf(
-                    payload,
-                    owner,
-                ),
+                self._nginx_conf(payload, owner),
                 encoding="utf-8",
             )
-
             if not nginx_link.exists():
+                nginx_link.symlink_to(nginx_path)
+            run(["nginx", "-t"])
+            run(["systemctl", "reload", "nginx"])
+            steps.append("Nginx configurado")
 
-                nginx_link.symlink_to(
-                    nginx_path
-                )
+        progress("permissions", 58, "Aplicando permisos odoo:odoo...")
+        run(["chown", "-R", f"{ODOO_SYSTEM_USER}:{ODOO_SYSTEM_GROUP}", str(base_dir)])
+        run(["chown", f"{ODOO_SYSTEM_USER}:{ODOO_SYSTEM_GROUP}", str(log_path)])
+        run(["chown", f"{ODOO_SYSTEM_USER}:{ODOO_SYSTEM_GROUP}", str(conf_path)])
+        os.chmod(conf_path, 0o640)
 
-            run(
-                [
-                    "nginx",
-                    "-t",
-                ]
-            )
+        progress("service", 60, "Registrando servicio Odoo...")
+        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "enable", payload["service_name"]])
+        if payload.get("start_service", True):
+            run(["systemctl", "restart", payload["service_name"]], timeout=120)
+            steps.append("Servicio Odoo iniciado")
 
-            run(
-                [
-                    "systemctl",
-                    "reload",
-                    "nginx",
-                ]
-            )
-
-            steps.append(
-                "Nginx configurado"
-            )
-
-        # -----------------------------------------------------
-        # OWNERSHIP
-        # -----------------------------------------------------
-
-        progress(
-            "service",
-            78,
-            "Aplicando permisos del servicio...",
-        )
-
-        run(
-            [
-                "chown",
-                "-R",
-                f"{ODOO_SYSTEM_USER}:{ODOO_SYSTEM_GROUP}",
-                str(base_dir),
-            ]
-        )
-
-        run(
-            [
-                "chown",
-                f"{ODOO_SYSTEM_USER}:{ODOO_SYSTEM_GROUP}",
-                str(log_path),
-            ]
-        )
-
-        run(
-            [
-                "chown",
-                f"{ODOO_SYSTEM_USER}:{ODOO_SYSTEM_GROUP}",
-                str(conf_path),
-            ]
-        )
-
-        os.chmod(
-            conf_path,
-            0o640,
-        )
-
-        steps.append(
-            "Permisos asignados a odoo:odoo"
-        )
-
-        # -----------------------------------------------------
-        # SYSTEMD
-        # -----------------------------------------------------
-
-        run(
-            [
-                "systemctl",
-                "daemon-reload",
-            ]
-        )
-
-        run(
-            [
-                "systemctl",
-                "enable",
-                payload[
-                    "service_name"
-                ],
-            ]
-        )
-
-        if payload.get(
-            "start_service",
-            True,
-        ):
-
-            run(
-                [
-                    "systemctl",
-                    "restart",
-                    payload[
-                        "service_name"
-                    ],
-                ],
-                timeout=120,
-            )
-
-            steps.append(
-                "Servicio Odoo iniciado"
-            )
-
-        progress(
-            "service",
-            82,
-            "Servicio Odoo iniciado.",
-        )
-
-        # -----------------------------------------------------
-        # SSL
-        # -----------------------------------------------------
-
-        if payload.get(
-            "create_ssl",
-            True,
-        ):
-
-            email = (
-
-                payload.get(
-                    "certbot_email"
-                )
-
-                or
-
-                self.pcfg.get(
-                    "certbot_email"
-                )
-
+        if payload.get("create_ssl", True):
+            email = str(
+                payload.get("certbot_email")
+                or self.pcfg.get("certbot_email")
                 or ""
-
             ).strip()
-
             if not email:
-
                 raise CommandError(
-                    "create_ssl está activo "
-                    "pero no hay certbot_email "
-                    "configurado."
+                    "create_ssl está activo pero no hay certbot_email configurado."
                 )
-
-            run(
-                [
-                    "certbot",
-                    "--nginx",
-                    "-d",
-                    payload[
-                        "domain"
-                    ],
-                    "--non-interactive",
-                    "--agree-tos",
-                    "--redirect",
-                    "-m",
-                    email,
-                ],
-                timeout=600,
-            )
-
-            steps.append(
-                "Certificado SSL instalado"
-            )
+            progress("ssl", 70, "Configurando certificado SSL...")
+            self._run_certbot_with_retry(payload["domain"], email)
+            steps.append("Certificado SSL instalado")
 
         return {
             "success": True,
@@ -1534,7 +1151,7 @@ class OdooProvisioner:
 
         progress(
             "waiting_dns",
-            85,
+            65,
             "Comprobando propagación DNS...",
         )
 
@@ -1658,7 +1275,7 @@ class OdooProvisioner:
 
             progress(
                 "ssl",
-                90,
+                70,
                 "Configurando certificado SSL...",
             )
 
@@ -1674,7 +1291,7 @@ class OdooProvisioner:
 
             progress(
                 "ssl",
-                94,
+                72,
                 "Certificado SSL configurado.",
             )
 
@@ -1706,7 +1323,7 @@ class OdooProvisioner:
 
         progress(
             "health",
-            97,
+            75,
             "Verificando servicio, puertos y HTTP...",
         )
 
@@ -2063,285 +1680,439 @@ class OdooProvisioner:
         )["success"]
 
     @staticmethod
-    def _ensure_postgres_role(
-        owner
-    ):
+    def _as_bool(value, default=False):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
 
-        sql = (
+    @staticmethod
+    def _safe_config_value(value, label):
+        value = str(value or "")
+        if not value or "\n" in value or "\r" in value:
+            raise CommandError(f"{label} no puede estar vacío ni contener saltos de línea.")
+        return value
 
-            "DO $$ BEGIN "
+    @staticmethod
+    def _normalize_repo_url(value):
+        value = str(value or "").strip().rstrip("/")
+        if value.endswith(".git"):
+            value = value[:-4]
+        return value.lower()
 
-            "IF NOT EXISTS "
-            "(SELECT 1 "
-            "FROM pg_roles "
-            f"WHERE rolname = '{owner}') "
-
-            "THEN "
-
-            f'CREATE ROLE "{owner}" '
-            "LOGIN CREATEDB; "
-
-            "END IF; "
-
-            "END $$;"
-        )
-
-        run(
-            [
-                "runuser",
-                "-u",
-                "postgres",
-                "--",
-                "psql",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-c",
-                sql,
-            ]
-        )
-
-    def _clone_custom_repo(
-        self,
-        repo,
-        target,
-    ):
-
+    def _git_environment(self, repo):
         env = os.environ.copy()
-
-        token = (
-            env.get(
-                "GITHUB_TOKEN"
-            )
-            or ""
-        ).strip()
-
-        branch = (
-            self.pcfg.get(
-                "custom_addons_branch"
-            )
-            or ""
-        ).strip()
-
-        cmd = [
-            "git",
-            "clone",
-        ]
-
-        if branch:
-
-            cmd += [
-                "--branch",
-                branch,
-            ]
-
+        token = ""
         if (
-            token
-            and repo.startswith(
-                "https://github.com/"
-            )
+            self._as_bool(self.pcfg.get("github_auth_enabled"), False)
+            and str(repo).startswith("https://github.com/")
         ):
-
-            askpass = Path(
-                "/tmp/"
-                "genesis-agent-git-askpass.sh"
-            )
-
-            askpass.write_text(
-                "#!/bin/sh\n"
-                'case "$1" in\n'
-                '  *Username*) '
-                'echo "x-access-token" ;;\n'
-                '  *Password*) '
-                'echo "$GITHUB_TOKEN" ;;\n'
-                "esac\n",
-                encoding="utf-8",
-            )
-
-            os.chmod(
-                askpass,
-                0o700,
-            )
-
-            env[
-                "GIT_ASKPASS"
-            ] = str(
-                askpass
-            )
-
-            env[
-                "GIT_TERMINAL_PROMPT"
-            ] = "0"
-
-            try:
-
-                run(
-                    cmd
-                    + [
-                        repo,
-                        str(target),
-                    ],
-                    timeout=1200,
-                    env=env,
+            token = str(self.pcfg.get("github_token") or os.getenv("GITHUB_TOKEN") or "").strip()
+        if not token:
+            if (
+                self._as_bool(self.pcfg.get("github_auth_enabled"), False)
+                and str(repo).startswith("https://github.com/")
+            ):
+                raise CommandError(
+                    "La autenticación GitHub está activa, pero el token no está configurado."
                 )
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            return env, None, ""
 
-            finally:
+        if not GITHUB_TOKEN_RE.fullmatch(token):
+            raise CommandError(
+                "El token GitHub configurado contiene usuario, email, URL "
+                "o caracteres no permitidos. Guarde únicamente el PAT."
+            )
 
-                askpass.unlink(
-                    missing_ok=True
+        username = str(self.pcfg.get("github_username") or "").strip()
+        if not username:
+            parsed = urlsplit(str(repo))
+            path_parts = parsed.path.strip("/").split("/")
+            username = (
+                path_parts[0]
+                if path_parts and path_parts[0]
+                else "x-access-token"
+            )
+        directory = Path(tempfile.mkdtemp(prefix="genesis-git-askpass-"))
+        os.chmod(directory, 0o700)
+        askpass = directory / "askpass.sh"
+        askpass.write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  *Username*) printf '%s\\n' \"$GITHUB_USERNAME\" ;;\n"
+            "  *Password*) printf '%s\\n' \"$GITHUB_TOKEN\" ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        os.chmod(askpass, 0o700)
+        env.update(
+            GIT_ASKPASS=str(askpass),
+            GIT_TERMINAL_PROMPT="0",
+            GITHUB_USERNAME=username,
+            GITHUB_TOKEN=token,
+            GIT_MERGE_AUTOEDIT="no",
+        )
+        return env, directory, token
+
+    def _run_git(self, cmd, repo, timeout=1200, check=True):
+        env, askpass_dir, token = self._git_environment(repo)
+        try:
+            return run(cmd, timeout=timeout, check=check, env=env)
+        except CommandError as exc:
+            message = str(exc)
+            if token:
+                message = message.replace(token, "***")
+            lowered = message.lower()
+            if (
+                "authentication failed" in lowered
+                or "invalid username or password" in lowered
+                or "invalid username or token" in lowered
+            ):
+                friendly = (
+                    "GitHub rechazó la autenticación. Verifique usuario, "
+                    "token y permisos sobre el repositorio."
                 )
+            elif "repository not found" in lowered:
+                friendly = "Repositorio no encontrado o sin permisos de acceso."
+            elif "permission denied" in lowered or "access denied" in lowered:
+                friendly = "GitHub denegó el acceso al repositorio."
+            elif "remote branch" in lowered and "not found" in lowered:
+                friendly = "La rama configurada no existe en el repositorio."
+            elif "already exists and is not an empty directory" in lowered:
+                friendly = "El destino Git ya existe y no está vacío."
+            else:
+                friendly = "Falló la descarga o actualización del repositorio."
+            raise CommandError(f"{friendly} Detalle: {message}") from exc
+        finally:
+            env.pop("GITHUB_TOKEN", None)
+            if askpass_dir:
+                shutil.rmtree(askpass_dir, ignore_errors=True)
 
-        else:
+    def _validate_git_access(self, repo):
+        self._run_git(
+            [
+                "git",
+                "-c",
+                "credential.helper=",
+                "ls-remote",
+                repo,
+                "HEAD",
+            ],
+            repo,
+            timeout=120,
+        )
 
-            run(
-                cmd
-                + [
+    def _prepare_odoo_tree(self, target, base_dir, repo, branch):
+        target = Path(target)
+        if target.exists():
+            if (target / "odoo-bin").is_file() and not (target / ".git").exists():
+                return False
+            if (target / ".git").exists():
+                raise CommandError(
+                    "El árbol Odoo preexistente conserva metadatos Git; no serán eliminados automáticamente."
+                )
+            raise CommandError(
+                "El directorio Odoo preexistente no contiene una instalación válida."
+            )
+
+        self._run_git(
+            [
+                "git", "clone", "--depth", "1", "--single-branch",
+                "--branch", branch, repo, str(target),
+            ],
+            repo,
+            timeout=1800,
+        )
+        if not (target / "odoo-bin").is_file():
+            raise CommandError("El clone upstream no contiene odoo-bin.")
+
+        base_resolved = Path(base_dir).resolve()
+        target_resolved = target.resolve()
+        if target_resolved.parent != base_resolved:
+            raise CommandError("Ruta del clone Odoo no permitida.")
+        for name in (".git", ".github"):
+            metadata = target_resolved / name
+            if metadata.exists() and metadata.parent == target_resolved:
+                shutil.rmtree(metadata)
+        return True
+
+    def _prepare_custom_repo(self, repo, target):
+        target = Path(target)
+        branch = str(self.pcfg.get("custom_addons_branch") or "").strip()
+        if not target.exists():
+            self._validate_git_access(repo)
+            cmd = ["git", "clone", "--single-branch"]
+            if branch:
+                cmd.extend(["--branch", branch])
+            cmd.extend([repo, str(target)])
+            self._run_git(cmd, repo)
+            return "Repositorio de módulos clonado"
+
+        if not (target / ".git").is_dir():
+            raise CommandError(
+                "El directorio custom preexistente no es un repositorio Git y no será reemplazado."
+            )
+        remote = self._run_git(
+            ["git", "-C", str(target), "remote", "get-url", "origin"],
+            repo,
+        ).get("output", "")
+        if self._normalize_repo_url(remote) != self._normalize_repo_url(repo):
+            raise CommandError(
+                "El directorio custom existente pertenece a otro repositorio."
+            )
+
+        self._validate_git_access(repo)
+        fetch = ["git", "-C", str(target), "fetch", "--prune", "origin"]
+        if branch:
+            fetch.append(branch)
+        self._run_git(fetch, repo)
+        if branch:
+            local = self._run_git(
+                ["git", "-C", str(target), "show-ref", "--verify", f"refs/heads/{branch}"],
+                repo,
+                check=False,
+            )
+            if local.get("success"):
+                self._run_git(["git", "-C", str(target), "checkout", branch], repo)
+            else:
+                self._run_git(
+                    ["git", "-C", str(target), "checkout", "-b", branch, "--track", f"origin/{branch}"],
                     repo,
-                    str(target),
-                ],
-                timeout=1200,
-                env=env,
+                )
+            self._run_git(
+                ["git", "-C", str(target), "merge", "--ff-only", f"origin/{branch}"],
+                repo,
             )
+        return "Repositorio de módulos validado y actualizado"
+
+    @staticmethod
+    def _run_postgres_sql_private(sql):
+        command = [
+            "runuser", "-u", "postgres", "--", "psql",
+            "-v", "ON_ERROR_STOP=1", "-d", "postgres",
+        ]
+        try:
+            process = subprocess.run(
+                command,
+                input=sql,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CommandError(
+                "Timeout configurando el rol PostgreSQL."
+            ) from exc
+        if process.returncode != 0:
+            output = str(process.stdout or "").strip()[-1200:]
+            raise CommandError(
+                "No fue posible configurar el rol PostgreSQL."
+                + (f" Detalle: {output}" if output else "")
+            )
+        return True
+
+    def _ensure_postgres_role(self, owner):
+        owner = assert_owner(owner)
+        password = self._safe_config_value(
+            self.pcfg.get("postgres_default_password") or "odoo",
+            "postgres_default_password",
+        )
+        quoted_owner = '"' + owner.replace('"', '""') + '"'
+        literal_owner = owner.replace("'", "''")
+        literal_password = password.replace("'", "''")
+        sql = (
+            "DO $$ BEGIN "
+            "IF NOT EXISTS (SELECT 1 FROM pg_roles "
+            f"WHERE rolname = '{literal_owner}') THEN "
+            f"CREATE ROLE {quoted_owner} LOGIN CREATEDB CREATEROLE; "
+            "END IF; END $$; "
+            f"ALTER ROLE {quoted_owner} WITH LOGIN CREATEDB CREATEROLE "
+            f"PASSWORD '{literal_password}';"
+        )
+        self._run_postgres_sql_private(sql)
+
+    def _validate_postgres_auth(self, owner, database_name="postgres"):
+        owner = assert_owner(owner)
+        host = self._safe_config_value(
+            self.pcfg.get("postgres_host") or "127.0.0.1", "postgres_host"
+        )
+        port = int(self.pcfg.get("postgres_port") or 5432)
+        password = self._safe_config_value(
+            self.pcfg.get("postgres_default_password") or "odoo",
+            "postgres_default_password",
+        )
+        env = os.environ.copy()
+        env["PGPASSWORD"] = password
+        result = run(
+            [
+                "psql", "-h", host, "-p", str(port), "-U", owner,
+                "-d", str(database_name), "-Atc", "SELECT 1",
+            ],
+            check=False,
+            timeout=30,
+            env=env,
+        )
+        env.pop("PGPASSWORD", None)
+        if not result.get("success") or result.get("output", "").strip() != "1":
+            detail = str(result.get("output") or "").strip()[-800:]
+            raise CommandError(
+                "No fue posible autenticar el usuario PostgreSQL generado."
+                + (f" Detalle: {detail}" if detail else "")
+            )
+        return True
 
     # ---------------------------------------------------------
     # GENERAR ODOO.CONF
     # ---------------------------------------------------------
 
-    @staticmethod
     def _odoo_conf(
+        self,
         payload,
         owner,
         addons,
         log_path,
     ):
-        version = str(
-            payload.get(
-                "version_odoo"
-            )
-            or "19"
+        version = str(payload.get("version_odoo") or "19")
+        interface = self._safe_config_value(
+            payload.get("http_interface") or "127.0.0.1",
+            "http_interface",
         )
-
-        interface = (
-            payload.get(
-                "http_interface"
-            )
-            or "127.0.0.1"
+        host = self._safe_config_value(
+            self.pcfg.get("postgres_host") or "127.0.0.1", "postgres_host"
         )
-
-        # ---------------------------------------------------------
-        # ODOO 17
-        # ---------------------------------------------------------
-
+        port = int(self.pcfg.get("postgres_port") or 5432)
+        password = self._safe_config_value(
+            self.pcfg.get("postgres_default_password") or "odoo",
+            "postgres_default_password",
+        )
+        admin_passwd = self._safe_config_value(
+            self.pcfg.get("admin_passwd") or "genesispos", "admin_passwd"
+        )
         if version == "17":
             port_lines = [
-                (
-                    "xmlrpc_port = "
-                    f"{payload['http_port']}"
-                ),
-
-                (
-                    "longpolling_port = "
-                    f"{payload['gevent_port']}"
-                ),
-
-                (
-                    "xmlrpc_interface = "
-                    f"{interface}"
-                ),
+                f"xmlrpc_port = {payload['http_port']}",
+                f"longpolling_port = {payload['gevent_port']}",
+                f"xmlrpc_interface = {interface}",
             ]
-
-        # ---------------------------------------------------------
-        # ODOO 18 / 19
-        # ---------------------------------------------------------
-
         else:
             port_lines = [
-                (
-                    "http_port = "
-                    f"{payload['http_port']}"
-                ),
-
-                (
-                    "gevent_port = "
-                    f"{payload['gevent_port']}"
-                ),
-
-                (
-                    "http_interface = "
-                    f"{interface}"
-                ),
+                f"http_port = {payload['http_port']}",
+                f"gevent_port = {payload['gevent_port']}",
+                f"http_interface = {interface}",
             ]
 
-        # ---------------------------------------------------------
-        # CONFIG
-        # ---------------------------------------------------------
-
-        database_name = str(
-            payload.get("database_name")
-            or ""
-        ).strip()
-
-        database_lines = []
-
-        if database_name:
-            database_lines.append(
-                f"dbfilter = ^{database_name}$"
-            )
-
+        database_name = str(payload.get("database_name") or "").strip()
+        database_lines = [f"dbfilter = ^{database_name}$"] if database_name else []
         return "\n".join(
             [
                 "[options]",
-
-                (
-                    "admin_passwd = "
-                    f"{secrets.token_urlsafe(32)}"
-                ),
-
-                (
-                    "db_user = "
-                    f"{owner}"
-                ),
-
-                "db_password = False",
-
+                f"admin_passwd = {admin_passwd}",
+                f"db_host = {host}",
+                f"db_port = {port}",
+                f"db_user = {owner}",
+                f"db_password = {password}",
                 *database_lines,
-
-                (
-                    "addons_path = "
-                    f"{','.join(addons)}"
-                ),
-
+                f"addons_path = {','.join(addons)}",
                 *port_lines,
-
-                (
-                    "workers = "
-                    f"{payload['workers']}"
-                ),
-
-                (
-                    "max_cron_threads = "
-                    f"{payload['max_cron_threads']}"
-                ),
-
-                (
-                    "proxy_mode = "
-                    f"{bool(payload.get('proxy_mode', True))}"
-                ),
-
-                (
-                    "logfile = "
-                    f"{log_path}"
-                ),
-
-                (
-                    "log_level = "
-                    f"{payload.get('log_level') or 'info'}"
-                ),
-
+                f"workers = {payload['workers']}",
+                f"max_cron_threads = {payload['max_cron_threads']}",
+                f"proxy_mode = {bool(payload.get('proxy_mode', True))}",
+                f"logfile = {log_path}",
+                f"log_level = {payload.get('log_level') or 'warn'}",
                 "list_db = True",
-
                 "",
             ]
         )
+
+    def _ensure_database_connection_config(self, path, owner):
+        path = Path(path)
+        if not path.is_file():
+            raise CommandError(
+                "No existe la configuración Odoo del servicio destino."
+            )
+        owner = assert_owner(owner)
+        parser = configparser.RawConfigParser(interpolation=None, strict=False)
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                parser.read_file(handle)
+        except (OSError, configparser.Error) as exc:
+            raise CommandError(
+                "No fue posible leer la configuración Odoo destino."
+            ) from exc
+        if not parser.has_section("options"):
+            raise CommandError("La configuración Odoo no contiene [options].")
+
+        parser.set(
+            "options",
+            "db_host",
+            self._safe_config_value(
+                self.pcfg.get("postgres_host") or "127.0.0.1",
+                "postgres_host",
+            ),
+        )
+        parser.set("options", "db_port", str(int(self.pcfg.get("postgres_port") or 5432)))
+        parser.set("options", "db_user", owner)
+        parser.set(
+            "options",
+            "db_password",
+            self._safe_config_value(
+                self.pcfg.get("postgres_default_password") or "odoo",
+                "postgres_default_password",
+            ),
+        )
+
+        current_stat = path.stat()
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=str(path.parent),
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                parser.write(handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, stat.S_IMODE(current_stat.st_mode))
+            os.chown(temporary, current_stat.st_uid, current_stat.st_gid)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return True
+
+    def _validate_odoo_conf(self, path, payload):
+        parser = configparser.RawConfigParser(interpolation=None, strict=False)
+        try:
+            with Path(path).open("r", encoding="utf-8") as handle:
+                parser.read_file(handle)
+        except (OSError, configparser.Error) as exc:
+            raise CommandError("No fue posible validar el archivo Odoo.") from exc
+        if not parser.has_section("options"):
+            raise CommandError("La configuración Odoo no contiene [options].")
+        required = [
+            "admin_passwd", "db_host", "db_port", "db_user", "db_password",
+            "addons_path", "workers", "proxy_mode", "logfile", "log_level",
+        ]
+        if str(payload.get("version_odoo") or "19") == "17":
+            required.extend(["xmlrpc_port", "longpolling_port", "xmlrpc_interface"])
+        else:
+            required.extend(["http_port", "gevent_port", "http_interface"])
+        missing = [
+            key for key in required
+            if not parser.has_option("options", key)
+            or not parser.get("options", key).strip()
+        ]
+        if missing:
+            raise CommandError(
+                "La configuración Odoo está incompleta: " + ", ".join(missing)
+            )
+        if parser.get("options", "db_password").strip().lower() in ("false", "none"):
+            raise CommandError("db_password no puede estar vacío con conexión TCP.")
+        return True
+
     # ---------------------------------------------------------
     # SYSTEMD
     # ---------------------------------------------------------

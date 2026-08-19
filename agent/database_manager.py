@@ -1,4 +1,5 @@
 import hashlib
+import grp
 import json
 import os
 import pwd
@@ -18,7 +19,7 @@ from .commands import (
     run,
     systemd_status,
 )
-from .provisioner import OdooProvisioner
+from .provisioner import DOMAIN_RE, OdooProvisioner
 
 
 DB_RE = re.compile(
@@ -66,6 +67,12 @@ class DatabaseManager:
             exist_ok=True,
             mode=0o700,
         )
+
+    def set_runtime_config(self, values):
+        self.provisioner.set_runtime_config(values)
+
+    def clear_runtime_config(self):
+        self.provisioner.clear_runtime_config()
 
     # =========================================================
     # VALIDACIÓN
@@ -216,99 +223,21 @@ class DatabaseManager:
         )
 
     def _ensure_role(self, role):
-        role = self._validate_role(
-            role
-        )
+        role = self._validate_role(role)
+        self.provisioner._ensure_postgres_role(role)
 
-        if self._role_exists(role):
-            return
-
-        quoted = (
-            '"'
-            + role.replace('"', '""')
-            + '"'
-        )
-
+    def _set_database_owner(self, database_name, owner):
+        database_name = self._validate_database_name(database_name)
+        owner = self._validate_role(owner)
+        quoted_owner = '"' + owner.replace('"', '""') + '"'
+        quoted_database = '"' + database_name.replace('"', '""') + '"'
         run(
             [
-                "runuser",
-                "-u",
-                "postgres",
-                "--",
-                "psql",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-d",
-                "postgres",
-                "-c",
-                (
-                    f"CREATE ROLE {quoted} "
-                    "LOGIN CREATEDB;"
-                ),
+                "runuser", "-u", "postgres", "--", "psql",
+                "-v", "ON_ERROR_STOP=1", "-d", "postgres", "-c",
+                f"ALTER DATABASE {quoted_database} OWNER TO {quoted_owner};",
             ],
             timeout=60,
-        )
-
-    def _terminate_connections(
-        self,
-        database_name,
-    ):
-        database_name = self._validate_database_name(
-            database_name
-        )
-
-        sql = (
-            "SELECT pg_terminate_backend(pid) "
-            "FROM pg_stat_activity "
-            "WHERE datname = "
-            f"{self._sql_literal(database_name)} "
-            "AND pid <> pg_backend_pid();"
-        )
-
-        run(
-            [
-                "runuser",
-                "-u",
-                "postgres",
-                "--",
-                "psql",
-                "-d",
-                "postgres",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-c",
-                sql,
-            ],
-            timeout=60,
-        )
-
-    def _drop_database(
-        self,
-        database_name,
-    ):
-        database_name = self._validate_database_name(
-            database_name
-        )
-
-        if not self._database_exists(
-            database_name
-        ):
-            return
-
-        self._terminate_connections(
-            database_name
-        )
-
-        run(
-            [
-                "runuser",
-                "-u",
-                "postgres",
-                "--",
-                "dropdb",
-                database_name,
-            ],
-            timeout=120,
         )
 
     def _create_database(
@@ -562,6 +491,42 @@ class DatabaseManager:
 
         return digest.hexdigest()
 
+    @staticmethod
+    def _tree_stats(path):
+        root = Path(path)
+        files = 0
+        size = 0
+        digest = hashlib.sha256()
+
+        if not root.is_dir():
+            return {
+                "files": 0,
+                "size": 0,
+                "sha256": "",
+            }
+
+        for candidate in sorted(root.rglob("*")):
+            if candidate.is_file():
+                files += 1
+                size += candidate.stat().st_size
+                digest.update(
+                    candidate.relative_to(root).as_posix().encode("utf-8")
+                )
+                digest.update(b"\0")
+
+                with candidate.open("rb") as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+
+        return {
+            "files": files,
+            "size": size,
+            "sha256": digest.hexdigest(),
+        }
+
     # =========================================================
     # DUMP
     # =========================================================
@@ -619,11 +584,71 @@ class DatabaseManager:
                 f"{error[-3000:]}"
             )
 
+    @staticmethod
+    def _pg_restore_from_file(
+        dump_path,
+        database_name,
+        database_owner,
+    ):
+        """Open the private dump as root and stream it to pg_restore."""
+
+        cmd = [
+            "runuser",
+            "-u",
+            "postgres",
+            "--",
+            "pg_restore",
+            "--exit-on-error",
+            "--no-owner",
+            "--no-privileges",
+            "--role",
+            database_owner,
+            "-d",
+            database_name,
+        ]
+
+        try:
+            # El Agent root abre el archivo antes de crear el proceso hijo.
+            # postgres solo recibe stdin y nunca necesita atravesar el
+            # directorio 0700 de transferencias.
+            with Path(dump_path).open("rb") as dump_handle:
+                process = subprocess.run(
+                    cmd,
+                    stdin=dump_handle,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=7200,
+                    check=False,
+                )
+
+        except subprocess.TimeoutExpired as exc:
+            raise CommandError(
+                "Timeout restaurando pg_dump."
+            ) from exc
+
+        if process.returncode != 0:
+            output = (
+                process.stdout
+                or b""
+            ).decode(
+                "utf-8",
+                errors="replace",
+            )
+
+            raise CommandError(
+                "pg_restore falló: "
+                f"{output[-3000:]}"
+            )
+
     # =========================================================
     # BACKUP
     # =========================================================
 
-    def backup(self, payload):
+    def backup(self, payload, progress_callback=None):
+        def progress(stage, percent, message):
+            if callable(progress_callback):
+                progress_callback(stage, percent, message)
+
         token = self._validate_token(
             payload.get("transfer_token")
         )
@@ -688,6 +713,12 @@ class DatabaseManager:
             # 1. PostgreSQL
             # -------------------------------------------------
 
+            progress(
+                "backup",
+                10,
+                f"Generando pg_dump de {database_name}...",
+            )
+
             self._pg_dump_to_file(
                 database_name,
                 dump_path,
@@ -720,15 +751,6 @@ class DatabaseManager:
                 / "manifest.json"
             )
 
-            manifest_path.write_text(
-                json.dumps(
-                    manifest,
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-
             # -------------------------------------------------
             # 3. Bundle: DB + filestore
             # -------------------------------------------------
@@ -737,6 +759,17 @@ class DatabaseManager:
                 data_dir
                 / "filestore"
                 / database_name
+            )
+
+            manifest["filestore_included"] = source_filestore.is_dir()
+
+            manifest_path.write_text(
+                json.dumps(
+                    manifest,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
             )
 
             with tarfile.open(
@@ -775,6 +808,12 @@ class DatabaseManager:
             # -------------------------------------------------
             # 4. Inicializar transferencia
             # -------------------------------------------------
+
+            progress(
+                "upload",
+                55,
+                "Iniciando transferencia al Controller...",
+            )
 
             begin = self.client.transfer_begin(
                 token=token,
@@ -825,6 +864,15 @@ class DatabaseManager:
                         )
                     )
 
+                    progress(
+                        "upload",
+                        min(
+                            92,
+                            55 + int((offset / size) * 37),
+                        ),
+                        f"Subiendo backup: {offset} de {size} bytes.",
+                    )
+
             # -------------------------------------------------
             # 6. Verificación controller
             # -------------------------------------------------
@@ -845,6 +893,12 @@ class DatabaseManager:
                     "El controlador no confirmó "
                     "la transferencia."
                 )
+
+            progress(
+                "finished",
+                100,
+                "Backup generado y transferido correctamente.",
+            )
 
             return {
                 "success": True,
@@ -1024,6 +1078,87 @@ class DatabaseManager:
             timeout=120,
         )
 
+        return {
+            "database_uuid": database_uuid,
+            "database_secret": database_secret,
+            "web_base_url": f"https://{target_domain}",
+        }
+
+    def _verify_cloned_database(
+        self,
+        database_name,
+        expected_identity,
+    ):
+        sql = """
+            SELECT key, value
+            FROM ir_config_parameter
+            WHERE key IN (
+                'database.uuid',
+                'database.secret',
+                'web.base.url',
+                'web.base.url.freeze'
+            )
+            ORDER BY key;
+        """
+
+        result = run(
+            [
+                "runuser",
+                "-u",
+                "postgres",
+                "--",
+                "psql",
+                "-At",
+                "-F",
+                "\t",
+                "-d",
+                database_name,
+                "-c",
+                sql,
+            ],
+            timeout=120,
+        )
+
+        values = {}
+
+        for line in (result.get("output") or "").splitlines():
+            key, separator, value = line.partition("\t")
+            if separator:
+                values[key] = value
+
+        checks = {
+            "database_exists": self._database_exists(database_name),
+            "database_uuid": (
+                values.get("database.uuid")
+                == expected_identity["database_uuid"]
+            ),
+            "database_secret": (
+                values.get("database.secret")
+                == expected_identity["database_secret"]
+            ),
+            "web_base_url": (
+                values.get("web.base.url")
+                == expected_identity["web_base_url"]
+            ),
+            "web_base_url_freeze_removed": (
+                "web.base.url.freeze" not in values
+            ),
+        }
+
+        failed = [
+            name
+            for name, passed in checks.items()
+            if not passed
+        ]
+
+        if failed:
+            raise CommandError(
+                "Falló la verificación posterior a la restauración: "
+                + ", ".join(failed)
+            )
+
+        return checks
+
     # =========================================================
     # INVENTARIO BD
     # =========================================================
@@ -1035,6 +1170,7 @@ class DatabaseManager:
         config,
         data_dir,
         system_user,
+        odoo_version="",
     ):
         sql = (
             "SELECT "
@@ -1120,6 +1256,7 @@ class DatabaseManager:
                 config.get(
                     "_odoo_version"
                 )
+                or odoo_version
                 or ""
             ),
             "system_user": system_user,
@@ -1132,7 +1269,11 @@ class DatabaseManager:
     # RESTAURACIÓN
     # =========================================================
 
-    def restore(self, payload):
+    def restore(self, payload, progress_callback=None):
+        def progress(stage, percent, message):
+            if callable(progress_callback):
+                progress_callback(stage, percent, message)
+
         token = self._validate_token(
             payload.get("transfer_token")
         )
@@ -1149,26 +1290,53 @@ class DatabaseManager:
             payload.get("service_name")
         )
 
-        replace_existing = bool(
-            payload.get(
-                "replace_existing",
-                False,
+        if payload.get("replace_existing"):
+            raise CommandError(
+                "replace_existing no está permitido en restauraciones "
+                "automáticas desde plan."
             )
-        )
 
         target_domain = str(
             payload.get("target_domain")
             or ""
         ).strip()
 
+        if not target_domain:
+            raise CommandError(
+                "Falta target_domain; no es seguro restaurar sin "
+                "sanitizar web.base.url."
+            )
+
+        if not DOMAIN_RE.fullmatch(target_domain):
+            raise CommandError(
+                f"target_domain inválido: {target_domain!r}"
+            )
+
+        try:
+            expected_size = int(
+                payload.get("expected_file_size") or 0
+            )
+        except (TypeError, ValueError):
+            expected_size = 0
+
+        expected_sha = str(
+            payload.get("expected_sha256") or ""
+        ).lower()
+
+        if (
+            expected_size <= 0
+            or len(expected_sha) != 64
+            or any(char not in "0123456789abcdef" for char in expected_sha)
+        ):
+            raise CommandError(
+                "Faltan tamaño/SHA256 válidos para verificar el bundle."
+            )
+
         existing = self._database_exists(
             database_name
         )
 
-        if (
-            existing
-            and not replace_existing
-        ):
+        if existing:
             raise CommandError(
                 f"La base {database_name!r} ya existe. "
                 "Por seguridad no será reemplazada."
@@ -1180,6 +1348,10 @@ class DatabaseManager:
                 payload.get("config_path"),
             )
         )
+        if not config_path:
+            raise CommandError(
+                "No fue posible localizar la configuración Odoo destino."
+            )
 
         system_user, system_group = (
             self._systemd_identity(
@@ -1235,14 +1407,38 @@ class DatabaseManager:
             # 1. Descargar desde controller
             # -------------------------------------------------
 
-            self.client.transfer_download(
+            progress(
+                "download",
+                5,
+                "Descargando bundle desde el Controller...",
+            )
+
+            download = self.client.transfer_download(
                 token,
                 bundle_path,
             )
 
+            downloaded_size = int(download.get("size") or 0)
+            downloaded_sha = self._sha256(bundle_path)
+
+            if (
+                downloaded_size != expected_size
+                or downloaded_sha != expected_sha
+            ):
+                raise CommandError(
+                    "El bundle descargado no coincide con tamaño/SHA256 "
+                    "verificados por el Controller."
+                )
+
             # -------------------------------------------------
             # 2. Verificar/extract
             # -------------------------------------------------
+
+            progress(
+                "verify_bundle",
+                18,
+                "Verificando y extrayendo bundle...",
+            )
 
             self._safe_extract(
                 bundle_path,
@@ -1269,6 +1465,54 @@ class DatabaseManager:
                     "El bundle no contiene manifest.json."
                 )
 
+            try:
+                manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                raise CommandError(
+                    "manifest.json no es válido."
+                ) from exc
+
+            if manifest.get("format") != 1:
+                raise CommandError(
+                    "Versión de bundle no soportada."
+                )
+
+            source_database = self._validate_database_name(
+                manifest.get("database_name")
+            )
+
+            source_version = str(
+                manifest.get("odoo_version") or ""
+            )
+            target_version = str(
+                payload.get("odoo_version") or ""
+            )
+
+            if (
+                source_version
+                and target_version
+                and source_version != target_version
+            ):
+                raise CommandError(
+                    "La versión Odoo del bundle no coincide con el destino."
+                )
+
+            filestore_included = bool(
+                manifest.get("filestore_included")
+            )
+
+            extracted_filestore = (
+                extract_dir
+                / "filestore"
+            )
+
+            if extracted_filestore.is_dir() != filestore_included:
+                raise CommandError(
+                    "El contenido del filestore no coincide con el manifest."
+                )
+
             # -------------------------------------------------
             # 3. Detener solamente la instancia destino
             # -------------------------------------------------
@@ -1286,10 +1530,11 @@ class DatabaseManager:
             # 4. PostgreSQL
             # -------------------------------------------------
 
-            if existing:
-                self._drop_database(
-                    database_name
-                )
+            progress(
+                "database_create",
+                35,
+                f"Creando base destino {database_name}...",
+            )
 
             self._create_database(
                 database_name,
@@ -1298,30 +1543,54 @@ class DatabaseManager:
 
             created_database = True
 
-            run(
-                [
-                    "runuser",
-                    "-u",
-                    "postgres",
-                    "--",
-                    "pg_restore",
-                    "--exit-on-error",
-                    "--no-owner",
-                    "--no-privileges",
-                    "--role",
-                    database_owner,
-                    "-d",
-                    database_name,
-                    str(dump_path),
-                ],
-                timeout=7200,
+            progress(
+                "restore",
+                45,
+                "Restaurando PostgreSQL por stdin...",
             )
+
+            self._pg_restore_from_file(
+                dump_path=dump_path,
+                database_name=database_name,
+                database_owner=database_owner,
+            )
+
+            progress(
+                "owner",
+                55,
+                "Asignando propietario final de la base restaurada...",
+            )
+            self._set_database_owner(database_name, database_owner)
+
+            postgres_auth_verified = True
+            if self.provisioner._as_bool(
+                self.provisioner.pcfg.get("postgres_validate_auth"), True
+            ):
+                progress(
+                    "postgres_auth",
+                    60,
+                    "Validando autenticación TCP de la base restaurada...",
+                )
+                self.provisioner._validate_postgres_auth(
+                    database_owner, database_name
+                )
+
+            self.provisioner._ensure_database_connection_config(
+                config_path, database_owner
+            )
+            config = self.provisioner._read_odoo_config(config_path)
 
             # -------------------------------------------------
             # 5. No conservar UUID/secret/url de la plantilla
             # -------------------------------------------------
 
-            self._sanitize_cloned_database(
+            progress(
+                "sanitize",
+                65,
+                "Generando identidad y URL propias del destino...",
+            )
+
+            expected_identity = self._sanitize_cloned_database(
                 database_name,
                 target_domain,
             )
@@ -1330,27 +1599,34 @@ class DatabaseManager:
             # 6. FILESTORE
             # -------------------------------------------------
 
-            extracted_filestore = (
-                extract_dir
-                / "filestore"
-            )
-
             target_filestore = (
                 data_dir
                 / "filestore"
                 / database_name
             )
 
+            source_filestore_stats = self._tree_stats(
+                extracted_filestore
+            )
+            target_filestore_stats = self._tree_stats(target_filestore)
+            filestore_owner_verified = not filestore_included
+
+            progress(
+                "filestore",
+                75,
+                (
+                    f"Restaurando filestore de {source_database} "
+                    f"como {database_name}..."
+                    if filestore_included
+                    else "El bundle no incluye filestore; continuando..."
+                ),
+            )
+
             if extracted_filestore.is_dir():
-
                 if target_filestore.exists():
-                    if not replace_existing:
-                        raise CommandError(
-                            "El filestore destino ya existe."
-                        )
-
-                    shutil.rmtree(
-                        target_filestore
+                    raise CommandError(
+                        "El filestore destino ya existe y no será "
+                        "sobrescrito."
                     )
 
                 target_filestore.parent.mkdir(
@@ -1378,48 +1654,41 @@ class DatabaseManager:
                     timeout=600,
                 )
 
-            # -------------------------------------------------
-            # 7. Asegurar dueño de la BD
-            # -------------------------------------------------
-
-            quoted_owner = (
-                '"'
-                + database_owner.replace(
-                    '"',
-                    '""',
+                target_filestore_stats = self._tree_stats(
+                    target_filestore
                 )
-                + '"'
+
+                if target_filestore_stats != source_filestore_stats:
+                    raise CommandError(
+                        "La verificación del filestore copiado no coincide."
+                    )
+
+                expected_uid = pwd.getpwnam(system_user).pw_uid
+                expected_gid = grp.getgrnam(system_group).gr_gid
+                target_stat = target_filestore.stat()
+                filestore_owner_verified = bool(
+                    target_stat.st_uid == expected_uid
+                    and target_stat.st_gid == expected_gid
+                )
+
+                if not filestore_owner_verified:
+                    raise CommandError(
+                        "El propietario final del filestore no coincide "
+                        "con el servicio destino."
+                    )
+
+            # El propietario y la autenticación TCP se verificaron antes
+            # de sanitizar la identidad de la plantilla.
+
+            progress(
+                "verify",
+                90,
+                "Verificando identidad, URL, inventario y filestore...",
             )
 
-            quoted_database = (
-                '"'
-                + database_name.replace(
-                    '"',
-                    '""',
-                )
-                + '"'
-            )
-
-            run(
-                [
-                    "runuser",
-                    "-u",
-                    "postgres",
-                    "--",
-                    "psql",
-                    "-v",
-                    "ON_ERROR_STOP=1",
-                    "-d",
-                    "postgres",
-                    "-c",
-                    (
-                        f"ALTER DATABASE "
-                        f"{quoted_database} "
-                        f"OWNER TO "
-                        f"{quoted_owner};"
-                    ),
-                ],
-                timeout=60,
+            identity_checks = self._verify_cloned_database(
+                database_name,
+                expected_identity,
             )
 
             # -------------------------------------------------
@@ -1441,6 +1710,18 @@ class DatabaseManager:
                 config=config,
                 data_dir=data_dir,
                 system_user=system_user,
+                odoo_version=target_version,
+            )
+
+            if database_info.get("name") != database_name:
+                raise CommandError(
+                    "PostgreSQL no devolvió la base destino esperada."
+                )
+
+            progress(
+                "finished",
+                100,
+                f"Base {database_name} restaurada y verificada.",
             )
 
             return {
@@ -1451,6 +1732,17 @@ class DatabaseManager:
                 ),
                 "database_name": database_name,
                 "database": database_info,
+                "database_verified": True,
+                "verification": {
+                    **identity_checks,
+                    "bundle_size": downloaded_size == expected_size,
+                    "bundle_sha256": downloaded_sha == expected_sha,
+                    "filestore": (
+                        target_filestore_stats == source_filestore_stats
+                    ),
+                    "filestore_owner": filestore_owner_verified,
+                    "postgres_auth": postgres_auth_verified,
+                },
                 "config_path": (
                     str(config_path)
                     if config_path
@@ -1464,20 +1756,7 @@ class DatabaseManager:
                 ),
             }
 
-        except Exception:
-            # Para una creación NUEVA no dejamos una BD
-            # parcialmente restaurada.
-            if (
-                created_database
-                and not existing
-            ):
-                try:
-                    self._drop_database(
-                        database_name
-                    )
-                except Exception:
-                    pass
-
+        except Exception as exc:
             if created_filestore:
                 try:
                     target_filestore = (
@@ -1492,6 +1771,12 @@ class DatabaseManager:
                     )
                 except Exception:
                     pass
+
+            if created_database:
+                raise CommandError(
+                    f"{exc} La base parcial {database_name!r} no fue "
+                    "eliminada automáticamente; requiere revisión manual."
+                ) from exc
 
             raise
 

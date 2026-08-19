@@ -4,6 +4,8 @@ import shutil
 import socket
 from pathlib import Path
 
+from .bootstrap import collect_bootstrap_inventory
+
 
 def _machine_id():
     for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
@@ -70,4 +72,5 @@ def collect_inventory(agent_version):
         },
         "load_average": _load_average(),
         "addresses": _addresses(),
+        "bootstrap": collect_bootstrap_inventory(),
     }

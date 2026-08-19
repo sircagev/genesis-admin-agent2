@@ -1,6 +1,6 @@
 import re
 import shlex
-from collections import  Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 
 from .commands import (
@@ -1308,9 +1308,9 @@ class OdooServiceDiscovery:
 
         La asociación BD -> servicio es conservadora:
         1. db_name exacto
-        2. dbfilter exacto ^nombre$
-        3. db_user solamente si ese owner tiene UNA sola BD
-           y existe UN solo servicio candidato.
+        2. dbfilter con coincidencia regex inequívoca
+        3. db_user solamente si existe UN solo servicio candidato
+           para ese owner.
         """
 
         if services is None:
@@ -1327,7 +1327,8 @@ class OdooServiceDiscovery:
                 pg_database_size(d.datname),
                 pg_encoding_to_char(d.encoding),
                 d.datcollate,
-                d.datctype
+                d.datctype,
+                current_setting('server_version')
             FROM pg_database d
             WHERE NOT d.datistemplate
               AND d.datallowconn
@@ -1383,7 +1384,7 @@ class OdooServiceDiscovery:
                 "\t"
             )
 
-            while len(parts) < 6:
+            while len(parts) < 7:
                 parts.append("")
 
             try:
@@ -1407,18 +1408,15 @@ class OdooServiceDiscovery:
                     "encoding": parts[3],
                     "collation": parts[4],
                     "ctype": parts[5],
+                    "postgresql_version": parts[6],
                 }
             )
 
-        owner_db_count = Counter(
-            database["owner"]
-            for database in raw_databases
-            if database.get("owner")
-        )
-
-        exact_map = defaultdict(
+        db_name_map = defaultdict(
             list
         )
+
+        dbfilter_rules = []
 
         owner_services = defaultdict(
             list
@@ -1431,7 +1429,7 @@ class OdooServiceDiscovery:
             ).strip()
 
             if db_name:
-                exact_map[
+                db_name_map[
                     db_name
                 ].append(
                     service
@@ -1442,24 +1440,24 @@ class OdooServiceDiscovery:
                 or ""
             ).strip()
 
-            exact_filter = re.fullmatch(
-                r"\^([A-Za-z0-9_.-]+)\$",
-                dbfilter,
-            )
-
-            if exact_filter:
-                exact_map[
-                    exact_filter.group(1)
-                ].append(
-                    service
-                )
+            if dbfilter:
+                try:
+                    dbfilter_rules.append(
+                        (re.compile(dbfilter), service)
+                    )
+                except re.error:
+                    # Una expresión inválida no aporta evidencia y tampoco
+                    # debe provocar una asociación alternativa por owner.
+                    pass
 
             db_user = str(
                 service.get("db_user")
                 or ""
             ).strip()
 
-            if db_user:
+            # Un servicio con una identidad de BD explícita que no coincide
+            # no debe recuperarse después por owner como si fuera ambiguo.
+            if db_user and not db_name and not dbfilter:
                 owner_services[
                     db_user
                 ].append(
@@ -1473,38 +1471,86 @@ class OdooServiceDiscovery:
             owner = database["owner"]
 
             service = None
+            association_method = ""
+            association_state = "unmatched"
+            association_message = (
+                "No existe evidencia inequívoca para asociar la base."
+            )
 
-            exact_candidates = []
+            name_candidates = []
 
-            for candidate in exact_map.get(
+            for candidate in db_name_map.get(
                 name,
                 [],
             ):
-                if candidate not in exact_candidates:
-                    exact_candidates.append(
+                if candidate not in name_candidates:
+                    name_candidates.append(
                         candidate
                     )
 
-            if len(exact_candidates) == 1:
-                service = exact_candidates[0]
+            if len(name_candidates) == 1:
+                service = name_candidates[0]
+                association_method = "db_name"
+                association_state = "matched"
+                association_message = "Asociación por db_name exacto."
 
-            elif (
-                not exact_candidates
-                and owner
-                and owner_db_count.get(
-                    owner,
-                    0,
-                ) == 1
-            ):
-                candidates = (
-                    owner_services.get(
-                        owner,
-                        []
-                    )
+            elif len(name_candidates) > 1:
+                association_state = "ambiguous"
+                association_message = (
+                    "Varios servicios declaran el mismo db_name exacto."
                 )
 
-                if len(candidates) == 1:
-                    service = candidates[0]
+            elif not name_candidates:
+                filter_candidates = []
+
+                for pattern, candidate in dbfilter_rules:
+                    if not pattern.fullmatch(name):
+                        continue
+
+                    if candidate not in filter_candidates:
+                        filter_candidates.append(
+                            candidate
+                        )
+
+                if len(filter_candidates) == 1:
+                    service = filter_candidates[0]
+                    association_method = "dbfilter"
+                    association_state = "matched"
+                    association_message = (
+                        "Asociación inequívoca por dbfilter."
+                    )
+
+                elif len(filter_candidates) > 1:
+                    association_state = "ambiguous"
+                    association_message = (
+                        "Varios servicios tienen un dbfilter que coincide."
+                    )
+
+                elif (
+                    not filter_candidates
+                    and owner
+                ):
+                    candidates = (
+                        owner_services.get(
+                            owner,
+                            []
+                        )
+                    )
+
+                    if len(candidates) == 1:
+                        service = candidates[0]
+                        association_method = "owner"
+                        association_state = "matched"
+                        association_message = (
+                            "Asociación por owner PostgreSQL y db_user únicos."
+                        )
+
+                    elif len(candidates) > 1:
+                        association_state = "ambiguous"
+                        association_message = (
+                            "El owner PostgreSQL coincide con el db_user de "
+                            "varios servicios."
+                        )
 
             item = {
                 **database,
@@ -1513,6 +1559,9 @@ class OdooServiceDiscovery:
                 "odoo_version": "",
                 "data_dir": "",
                 "system_user": "",
+                "association_method": association_method,
+                "association_state": association_state,
+                "association_message": association_message,
             }
 
             if service:

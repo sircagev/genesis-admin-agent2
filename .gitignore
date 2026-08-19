@@ -3,3 +3,4 @@ venv/
 config/config.yaml
 __pycache__/
 *.pyc
+AGENTS.md
