@@ -8,6 +8,7 @@ from .discovery import OdooServiceDiscovery
 from .provisioner import OdooProvisioner
 from .database_manager import DatabaseManager
 from .bootstrap import ServerBootstrapAuditor
+from .updater import AgentUpdater
 
 
 class JobExecutor:
@@ -30,6 +31,11 @@ class JobExecutor:
 
         self.bootstrap_auditor = ServerBootstrapAuditor(
             progress_callback=self._progress
+        )
+
+        self.agent_updater = AgentUpdater(
+            config,
+            progress_callback=self._progress,
         )
 
         self.allowed_exact = set(
@@ -84,6 +90,12 @@ class JobExecutor:
 
             "bootstrap.audit":
                 self.bootstrap_audit,
+
+            "agent.update.check":
+                self.agent_update_check,
+
+            "agent.update.apply":
+                self.agent_update_apply,
 
             "provision.prepare":
                 self.provision_prepare,
@@ -331,6 +343,12 @@ class JobExecutor:
 
     def bootstrap_audit(self, payload):
         return self.bootstrap_auditor.audit(payload)
+
+    def agent_update_check(self, payload):
+        return self.agent_updater.check(payload)
+
+    def agent_update_apply(self, payload):
+        return self.agent_updater.apply(payload)
 
     # ---------------------------------------------------------
     # APROVISIONAMIENTO EXISTENTE

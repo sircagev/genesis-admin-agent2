@@ -20,6 +20,10 @@ allowed_exact:
 allowed_prefix:
   - odoo-server-
 
+update:
+  repository: "sircagev/genesis-admin-agent2"
+  branch: "main"
+
 provision:
   base_dir: "/opt"
   odoo_repo: "https://github.com/odoo/odoo.git"

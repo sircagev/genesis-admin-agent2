@@ -22,6 +22,10 @@ DEFAULTS = {
     "log_default_lines": 200,
     "allowed_exact": ["nginx", "remote_print"],
     "allowed_prefix": ["odoo-server-"],
+    "update": {
+        "repository": "sircagev/genesis-admin-agent2",
+        "branch": "main",
+    },
     "provision": {
         "base_dir": "/opt",
         "odoo_repo": "https://github.com/odoo/odoo.git",
@@ -94,6 +98,8 @@ class AgentConfig:
             raise RuntimeError("allowed_prefix debe ser una lista YAML.")
         if not isinstance(self.data.get("provision"), dict):
             raise RuntimeError("provision debe ser un objeto YAML.")
+        if not isinstance(self.data.get("update"), dict):
+            raise RuntimeError("update debe ser un objeto YAML.")
 
     def get(self, key, default=None):
         return self.data.get(key, default)

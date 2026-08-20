@@ -8,6 +8,7 @@ import threading
 from . import __version__
 from .client import ControllerClient
 from .config import AgentConfig
+from .commands import run as run_command
 from .executor import JobExecutor
 from .inventory import collect_inventory
 from .discovery import OdooServiceDiscovery
@@ -257,6 +258,8 @@ def main():
 
             keepalive_thread.start()
 
+            restart_after_result = False
+
             try:
                 if job.get("job_type") in (
                     "provision.prepare",
@@ -270,6 +273,9 @@ def main():
 
                 result = executor.execute(job)
                 success = bool(result.get("success", True))
+                restart_requested = bool(
+                    success and result.get("restart_required")
+                )
                 client.job_result(
                     job_id,
                     success,
@@ -280,6 +286,8 @@ def main():
                         else result.get("message") or "Operación fallida"
                     ),
                 )
+                # Solo reiniciar cuando Odoo confirmó el resultado positivo.
+                restart_after_result = restart_requested
             except Exception as exc:  # pylint: disable=broad-except
                 _logger.exception("Trabajo %s falló", job_id)
                 client.job_result(
@@ -300,6 +308,27 @@ def main():
                 executor.set_progress_callback(
                     None
                 )
+
+            if restart_after_result:
+                _logger.info(
+                    "Resultado de actualización reportado; "
+                    "solicitando reinicio del Agent."
+                )
+                restart_result = run_command(
+                    [
+                        "systemctl",
+                        "--no-block",
+                        "restart",
+                        "genesis-admin-agent.service",
+                    ],
+                    check=False,
+                    timeout=15,
+                )
+                if not restart_result.get("success"):
+                    _logger.error(
+                        "No fue posible solicitar el reinicio del Agent."
+                    )
+                return
 
         except Exception:  # pylint: disable=broad-except
             _logger.exception("Error de comunicación con el controlador")

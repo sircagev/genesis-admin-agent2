@@ -13,6 +13,7 @@ from agent import __version__  # noqa: E402
 from agent.client import ControllerClient  # noqa: E402
 from agent.config import AgentConfig  # noqa: E402
 from agent.inventory import collect_inventory  # noqa: E402
+from agent.updater import AgentUpdater  # noqa: E402
 
 
 SERVICE = "genesis-admin-agent.service"
@@ -206,41 +207,29 @@ def cmd_doctor(_args):
 
 def cmd_update(_args):
     require_root()
+    config = load_config()
+    updater = AgentUpdater(config, base_path=BASE)
 
-    if not (BASE / ".git").exists():
-        raise SystemExit(
-            f"{BASE} no es un repositorio Git; no se puede actualizar."
-        )
+    print("Comprobando actualización...")
+    available = updater.check({})
+    print(available.get("message") or available)
 
-    print("Actualizando código...")
-    run(["git", "-C", str(BASE), "fetch", "--all", "--prune"])
-    run(["git", "-C", str(BASE), "reset", "--hard", "origin/main"])
+    if not (
+        available.get("update_available")
+        or available.get("restart_required")
+    ):
+        return
 
-    print("Actualizando dependencias...")
-    run(
-        [
-            str(BASE / "venv/bin/pip"),
-            "install",
-            "--upgrade",
-            "-r",
-            str(BASE / "requirements.txt"),
-        ]
+    result = updater.apply(
+        {
+            "target_sha": available["target_sha"],
+            "target_version": available["available_version"],
+        }
     )
-
-    cli = BASE / "bin/genesis-agent"
-    cli.chmod(0o755)
-    link = Path("/usr/local/bin/genesis-agent")
-    if link.exists() or link.is_symlink():
-        link.unlink()
-    link.symlink_to(cli)
-
-    service_tpl = BASE / "systemd/genesis-admin-agent.service.tpl"
-    service_dst = Path("/etc/systemd/system/genesis-admin-agent.service")
-    service_dst.write_text(service_tpl.read_text(encoding="utf-8"), encoding="utf-8")
-
-    run(["systemctl", "daemon-reload"])
-    run(["systemctl", "restart", SERVICE])
-    print("✓ Agente actualizado y reiniciado.")
+    print(result.get("message") or result)
+    if result.get("restart_required"):
+        run(["systemctl", "restart", SERVICE])
+        print("✓ Agente actualizado y reiniciado.")
 
 
 def build_parser():
