@@ -11,7 +11,7 @@ class CommandError(RuntimeError):
     pass
 
 
-def run(cmd, timeout=30, check=True, env=None):
+def run(cmd, timeout=30, check=True, env=None, input_data=None):
     try:
         result = subprocess.run(
             cmd,
@@ -21,6 +21,7 @@ def run(cmd, timeout=30, check=True, env=None):
             timeout=timeout,
             check=False,
             env=env,
+            input=input_data,
         )
     except subprocess.TimeoutExpired as exc:
         raise CommandError(f"Timeout ejecutando: {' '.join(cmd)}") from exc

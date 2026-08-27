@@ -8,7 +8,10 @@ from .discovery import OdooServiceDiscovery
 from .provisioner import OdooProvisioner
 from .database_manager import DatabaseManager
 from .bootstrap import ServerBootstrapAuditor
+from .server_configurator import ServerConfigurator
 from .updater import AgentUpdater
+from .module_manager import OdooModuleManager
+from .license_manager import OdooLicenseManager
 
 
 class JobExecutor:
@@ -33,7 +36,21 @@ class JobExecutor:
             progress_callback=self._progress
         )
 
+        self.server_configurator = ServerConfigurator(
+            progress_callback=self._progress
+        )
+
         self.agent_updater = AgentUpdater(
+            config,
+            progress_callback=self._progress,
+        )
+
+        self.module_manager = OdooModuleManager(
+            config,
+            progress_callback=self._progress,
+        )
+
+        self.license_manager = OdooLicenseManager(
             config,
             progress_callback=self._progress,
         )
@@ -57,10 +74,14 @@ class JobExecutor:
         values = values if isinstance(values, dict) else {}
         self.provisioner.set_runtime_config(values)
         self.database_manager.set_runtime_config(values)
+        self.module_manager.set_runtime_config(values)
+        self.server_configurator.set_runtime_config(values)
 
     def clear_runtime_config(self):
         self.provisioner.clear_runtime_config()
         self.database_manager.clear_runtime_config()
+        self.module_manager.clear_runtime_config()
+        self.server_configurator.clear_runtime_config()
 
     def execute(self, job):
         job_type = job.get("job_type")
@@ -91,11 +112,29 @@ class JobExecutor:
             "bootstrap.audit":
                 self.bootstrap_audit,
 
+            "bootstrap.install":
+                self.bootstrap_install,
+
+            "security.prepare":
+                self.security_prepare,
+
+            "security.enforce":
+                self.security_enforce,
+
             "agent.update.check":
                 self.agent_update_check,
 
             "agent.update.apply":
                 self.agent_update_apply,
+
+            "inventory.modules":
+                self.inventory_modules,
+
+            "modules.plan":
+                self.modules_plan,
+
+            "modules.apply":
+                self.modules_apply,
 
             "provision.prepare":
                 self.provision_prepare,
@@ -120,6 +159,9 @@ class JobExecutor:
 
             "database.restore":
                 self.database_restore,
+
+            "license.bootstrap":
+                self.license_bootstrap,
         }
 
         handler = handlers.get(
@@ -344,11 +386,33 @@ class JobExecutor:
     def bootstrap_audit(self, payload):
         return self.bootstrap_auditor.audit(payload)
 
+    def bootstrap_install(self, payload):
+        return self.server_configurator.install(payload)
+
+    def security_prepare(self, payload):
+        return self.server_configurator.prepare_security(payload)
+
+    def security_enforce(self, payload):
+        return self.server_configurator.enforce_security(payload)
+
     def agent_update_check(self, payload):
         return self.agent_updater.check(payload)
 
     def agent_update_apply(self, payload):
         return self.agent_updater.apply(payload)
+
+    def inventory_modules(self, payload):
+        return self.module_manager.inventory(payload)
+
+    def modules_plan(self, payload):
+        return self.module_manager.plan(payload)
+
+    def modules_apply(self, payload):
+        return self.module_manager.apply(payload)
+
+    def license_bootstrap(self, payload):
+        self._allowed_unit(payload)
+        return self.license_manager.bootstrap(payload)
 
     # ---------------------------------------------------------
     # APROVISIONAMIENTO EXISTENTE

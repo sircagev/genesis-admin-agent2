@@ -339,6 +339,45 @@ class ProvisioningContractTest(unittest.TestCase):
         self.assertIn("db_password = one-source-secret", config)
         self.assertIn("addons_path = " + ",".join(addons), config)
 
+    def test_nginx_routes_websocket_and_longpolling_to_gevent(self):
+        provisioner = self._provisioner()
+        payload = {
+            **self._payload(),
+            "domain": "customer.example.com",
+        }
+        config = provisioner._nginx_conf(payload, "customer")
+
+        self.assertIn("server 127.0.0.1:8069;", config)
+        self.assertIn("server 127.0.0.1:8070;", config)
+        self.assertIn("location /websocket", config)
+        self.assertIn("proxy_http_version 1.1;", config)
+        self.assertIn("proxy_set_header Upgrade $http_upgrade;", config)
+        self.assertIn('proxy_set_header Connection "upgrade";', config)
+        self.assertIn("proxy_set_header Host $host;", config)
+        self.assertIn("proxy_buffering off;", config)
+        self.assertIn("location /longpolling", config)
+        self.assertTrue(
+            provisioner._validate_nginx_conf(config, payload, "customer")
+        )
+
+    def test_nginx_validation_rejects_incomplete_websocket_proxy(self):
+        provisioner = self._provisioner()
+        payload = {
+            **self._payload(),
+            "domain": "customer.example.com",
+        }
+        config = provisioner._nginx_conf(payload, "customer").replace(
+            "proxy_http_version 1.1;",
+            "",
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "HTTP/1.1 para WebSocket",
+        ):
+            provisioner._validate_nginx_conf(config, payload, "customer")
+
     def test_role_and_config_use_same_password_source(self):
         provisioner = self._provisioner()
         with patch.object(
@@ -622,6 +661,24 @@ class ProvisioningContractTest(unittest.TestCase):
         self.assertNotIn(token, message)
         self.assertIn("GitHub rechazó la autenticación", message)
         self.assertIn("Verifique usuario, token y permisos", message)
+
+    def test_missing_remote_ref_reports_configured_branch(self):
+        provisioner = self._provisioner()
+
+        def fake_run(_command, **_kwargs):
+            raise CommandError(
+                "fatal: couldn't find remote ref refs/heads/main"
+            )
+
+        with patch("agent.provisioner.run", fake_run):
+            with self.assertRaisesRegex(
+                CommandError,
+                "La rama configurada no existe",
+            ):
+                provisioner._run_git(
+                    ["git", "fetch"],
+                    "https://github.com/acme/private.git",
+                )
 
     def test_enabled_github_auth_requires_token(self):
         provisioner = self._provisioner(

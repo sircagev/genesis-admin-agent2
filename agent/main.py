@@ -267,6 +267,10 @@ def main():
                     "provision.auto_create",
                     "provision.finalize",
                     "database.restore",
+                    "inventory.modules",
+                    "modules.plan",
+                    "modules.apply",
+                    "security.prepare",
                 ):
                     runtime = client.provisioning_config()
                     executor.set_runtime_config(runtime.get("config") or {})

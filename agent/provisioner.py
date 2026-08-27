@@ -56,6 +56,7 @@ class OdooProvisioner:
             "admin_passwd",
             "custom_addons_repo",
             "custom_addons_branch",
+            "custom_addons_subpaths",
             "github_auth_enabled",
             "github_username",
             "github_token",
@@ -66,6 +67,39 @@ class OdooProvisioner:
 
     def clear_runtime_config(self):
         self.pcfg = dict(self.base_pcfg)
+
+    def _custom_addons_paths(self, custom_dir):
+        raw = self.pcfg.get("custom_addons_subpaths")
+        if not raw:
+            values = ["custom_addons", "modulos"]
+        elif isinstance(raw, (list, tuple)):
+            values = list(raw)
+        else:
+            values = re.split(r"[,\n]+", str(raw))
+
+        root = Path(custom_dir).resolve()
+        result = []
+        for value in values:
+            subpath = str(value or "").strip().strip("/")
+            candidate = Path(subpath)
+            if (
+                not subpath
+                or candidate.is_absolute()
+                or "." in candidate.parts
+                or ".." in candidate.parts
+                or not re.fullmatch(r"[A-Za-z0-9_./-]+", subpath)
+            ):
+                raise CommandError("Subruta de addons custom invalida.")
+            resolved = (root / candidate).resolve()
+            if root not in resolved.parents:
+                raise CommandError("Subruta de addons fuera del repositorio.")
+            value = str(resolved)
+            if value not in result:
+                result.append(value)
+
+        if not result:
+            raise CommandError("Configure al menos una subruta de addons custom.")
+        return result
 
     # ---------------------------------------------------------
     # NORMALIZACIÓN
@@ -1009,8 +1043,7 @@ class OdooProvisioner:
 
         addons = [
             str(odoo_dir / "addons"),
-            str(custom_dir / "custom_addons"),
-            str(custom_dir / "modulos"),
+            *self._custom_addons_paths(custom_dir),
         ]
 
         progress("config", 50, "Generando y validando configuración de Odoo...")
@@ -1031,8 +1064,10 @@ class OdooProvisioner:
 
         progress("nginx", 55, "Configurando Nginx...")
         if payload.get("create_nginx", True):
+            nginx_config = self._nginx_conf(payload, owner)
+            self._validate_nginx_conf(nginx_config, payload, owner)
             nginx_path.write_text(
-                self._nginx_conf(payload, owner),
+                nginx_config,
                 encoding="utf-8",
             )
             if not nginx_link.exists():
@@ -1066,6 +1101,13 @@ class OdooProvisioner:
                 )
             progress("ssl", 70, "Configurando certificado SSL...")
             self._run_certbot_with_retry(payload["domain"], email)
+            if payload.get("create_nginx", True):
+                self._validate_nginx_conf(
+                    nginx_path.read_text(encoding="utf-8"),
+                    payload,
+                    owner,
+                )
+                run(["nginx", "-t"], timeout=30)
             steps.append("Certificado SSL instalado")
 
         return {
@@ -1778,7 +1820,13 @@ class OdooProvisioner:
                 friendly = "Repositorio no encontrado o sin permisos de acceso."
             elif "permission denied" in lowered or "access denied" in lowered:
                 friendly = "GitHub denegó el acceso al repositorio."
-            elif "remote branch" in lowered and "not found" in lowered:
+            elif (
+                "couldn't find remote ref" in lowered
+                or (
+                    "remote branch" in lowered
+                    and "not found" in lowered
+                )
+            ):
                 friendly = "La rama configurada no existe en el repositorio."
             elif "already exists and is not an empty directory" in lowered:
                 friendly = "El destino Git ya existe y no está vacío."
@@ -2198,10 +2246,26 @@ class OdooProvisioner:
 
                 location /websocket {{
                     proxy_pass http://{chat};
-
+                    proxy_http_version 1.1;
                     proxy_set_header Upgrade $http_upgrade;
-
                     proxy_set_header Connection "upgrade";
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Forwarded-Host $host;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_cache_bypass $http_upgrade;
+                    proxy_buffering off;
+                }}
+
+                location /longpolling {{
+                    proxy_pass http://{chat};
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Forwarded-Host $host;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_set_header X-Real-IP $remote_addr;
                 }}
 
                 location / {{
@@ -2210,3 +2274,56 @@ class OdooProvisioner:
                 }}
             }}
             """
+
+    @staticmethod
+    def _validate_nginx_conf(config, payload, owner):
+        upstream = "odoo_" + owner.replace("-", "_")
+        chat = upstream + "_chat"
+
+        def block(pattern, label):
+            match = re.search(pattern, config, flags=re.I | re.S)
+            if not match:
+                raise CommandError(
+                    f"La configuración Nginx no contiene {label}."
+                )
+            return match.group(1)
+
+        main_upstream = block(
+            rf"\bupstream\s+{re.escape(upstream)}\s*\{{([^{{}}]*)\}}",
+            "el upstream HTTP de Odoo",
+        )
+        chat_upstream = block(
+            rf"\bupstream\s+{re.escape(chat)}\s*\{{([^{{}}]*)\}}",
+            "el upstream WebSocket de Odoo",
+        )
+        websocket = block(
+            r"\blocation\s+/websocket\s*\{([^{}]*)\}",
+            "la ruta /websocket",
+        )
+        longpolling = block(
+            r"\blocation\s+/longpolling\s*\{([^{}]*)\}",
+            "la ruta /longpolling",
+        )
+
+        required = [
+            (main_upstream, rf"127\.0\.0\.1:{int(payload['http_port'])}\s*;", "puerto HTTP"),
+            (chat_upstream, rf"127\.0\.0\.1:{int(payload['gevent_port'])}\s*;", "puerto gevent"),
+            (websocket, rf"proxy_pass\s+http://{re.escape(chat)}\s*;", "proxy WebSocket"),
+            (websocket, r"proxy_http_version\s+1\.1\s*;", "HTTP/1.1 para WebSocket"),
+            (websocket, r"proxy_set_header\s+Upgrade\s+\$http_upgrade\s*;", "header Upgrade"),
+            (websocket, r"proxy_set_header\s+Connection\s+(?:\"upgrade\"|\$connection_upgrade)\s*;", "header Connection"),
+            (websocket, r"proxy_set_header\s+Host\s+\$host\s*;", "header Host"),
+            (websocket, r"proxy_set_header\s+X-Forwarded-For\s+\$proxy_add_x_forwarded_for\s*;", "header X-Forwarded-For"),
+            (websocket, r"proxy_set_header\s+X-Forwarded-Proto\s+\$scheme\s*;", "header X-Forwarded-Proto"),
+            (longpolling, rf"proxy_pass\s+http://{re.escape(chat)}\s*;", "proxy longpolling"),
+        ]
+        missing = [
+            label for text, pattern, label in required
+            if not re.search(pattern, text, flags=re.I)
+        ]
+        if missing:
+            raise CommandError(
+                "La configuración Nginx de Odoo está incompleta: "
+                + ", ".join(missing)
+            )
+        return True

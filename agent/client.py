@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 
 import requests
 
@@ -205,14 +206,34 @@ class ControllerClient:
         result=None,
         error=None,
     ):
-        return self._post(
-            f"/infra/agent/v1/jobs/{job_id}/result",
-            {
-                "success": bool(success),
-                "result": result or {},
-                "error": error or "",
-            },
-        )
+        path = f"/infra/agent/v1/jobs/{job_id}/result"
+        payload = {
+            "success": bool(success),
+            "result": result or {},
+            "error": error or "",
+        }
+        attempts = 18
+        for attempt in range(attempts):
+            try:
+                return self._post(path, payload)
+            except Exception as exc:
+                message = str(exc).lower()
+                transient = (
+                    isinstance(
+                        exc,
+                        (
+                            requests.ConnectionError,
+                            requests.Timeout,
+                        ),
+                    )
+                    or message.startswith("http 502 ")
+                    or message.startswith("http 503 ")
+                    or message.startswith("http 504 ")
+                )
+                if not transient or attempt >= attempts - 1:
+                    raise
+                time.sleep(min(2 + attempt * 2, 10))
+        raise RuntimeError("No fue posible reportar el resultado del trabajo.")
 
     # =========================================================
     # TRANSFERENCIA DE BASES DE DATOS
