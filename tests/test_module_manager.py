@@ -187,6 +187,49 @@ class OdooModuleManagerTest(unittest.TestCase):
             any(" merge " in f" {' '.join(command)} " for command in self.runner.commands)
         )
 
+    def test_manual_upgrade_of_uninstalled_module_is_ignored_in_plan(self):
+        catalog = {
+            "module_a": {
+                "version": "19.0.1.0.0",
+                "installable": True,
+                "dependencies": [],
+            }
+        }
+        steps = self.manager._validate_steps(
+            [{"action": "upgrade", "module": "module_a"}]
+        )
+
+        expanded, blockers, proposed, _requested = (
+            self.manager._expand_versioned_steps(
+                steps,
+                "manual",
+                catalog,
+                {},
+                [],
+                {},
+            )
+        )
+
+        self.assertFalse(blockers)
+        self.assertEqual(expanded, [])
+        self.assertEqual(proposed, {})
+
+    def test_upgrade_of_uninstalled_module_is_skipped_at_execution(self):
+        context = {"database": "customer", "runtime": {"version": "19"}}
+        with patch.object(
+            self.manager,
+            "_module_state",
+            return_value={"state": "uninstalled"},
+        ):
+            result = self.manager._execute_step(
+                context,
+                {"action": "upgrade", "module": "module_a"},
+            )
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], "not_installed")
+        self.assertEqual(self.runner.commands, [])
+
     def test_odoo19_install_uses_official_module_cli(self):
         context = {
             "database": "customer",

@@ -972,9 +972,8 @@ class OdooModuleManager:
                 and current.get("state")
                 not in ("installed", "to upgrade")
             ):
-                blockers.append(
-                    f"El modulo {name} no esta instalado para actualizar."
-                )
+                # An upgrade never installs a missing module implicitly.
+                # Keep the deployment executable and omit this operation.
                 return
 
             target_version = str(
@@ -1501,7 +1500,12 @@ class OdooModuleManager:
                 "status": "skipped",
             }
         if action == "upgrade" and not installed:
-            raise CommandError(f"El modulo {name} no esta instalado.")
+            return {
+                "module": name,
+                "action": action,
+                "status": "skipped",
+                "reason": "not_installed",
+            }
         if (
             action == "upgrade"
             and required
