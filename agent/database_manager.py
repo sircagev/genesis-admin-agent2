@@ -141,6 +141,133 @@ class DatabaseManager:
             "''",
         ) + "'"
 
+    @staticmethod
+    def _sql_identifier(value):
+        value = str(value or "")
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", value):
+            raise CommandError(f"Identificador SQL inválido: {value!r}")
+        return f'"{value}"'
+
+    def _table_exists(self, table_name, database_name):
+        table_name = self._sql_identifier(table_name)
+        result = run(
+            [
+                "runuser", "-u", "postgres", "--", "psql", "-At",
+                "-d", database_name, "-c",
+                "SELECT to_regclass('public.' || "
+                f"{self._sql_literal(table_name)});",
+            ],
+            check=False,
+            timeout=30,
+        )
+        return bool(
+            result.get("success") and (result.get("output") or "").strip()
+        )
+
+    def _record_exists(self, table_name, record_id, database_name):
+        table_name = self._sql_identifier(table_name)
+        result = run(
+            [
+                "runuser", "-u", "postgres", "--", "psql", "-At",
+                "-d", database_name, "-c",
+                f"SELECT 1 FROM {table_name} WHERE id = "
+                f"{int(record_id)} LIMIT 1;",
+            ],
+            check=False,
+            timeout=30,
+        )
+        return bool(
+            result.get("success") and (result.get("output") or "").strip() == "1"
+        )
+
+    def _copy_client_to_main_partner(self, database_name, client_data):
+        if not isinstance(client_data, dict):
+            return {"applied": [], "skipped": []}
+
+        result = run(
+            [
+                "runuser", "-u", "postgres", "--", "psql", "-At", "-F", "\t",
+                "-d", database_name, "-c",
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'res_partner';",
+            ],
+            timeout=30,
+        )
+        columns = set((result.get("output") or "").splitlines())
+        if not columns:
+            return {"applied": [], "skipped": list(client_data)}
+
+        target_id_result = run(
+            [
+                "runuser", "-u", "postgres", "--", "psql", "-At", "-d",
+                database_name, "-c",
+                "SELECT res_id FROM ir_model_data WHERE module = 'base' "
+                "AND name = 'main_partner' AND model = 'res.partner' LIMIT 1;",
+            ],
+            check=False,
+            timeout=30,
+        )
+        try:
+            target_id = int((target_id_result.get("output") or "").strip())
+        except (TypeError, ValueError):
+            return {"applied": [], "skipped": list(client_data)}
+
+        assignments = []
+        applied = []
+        skipped = []
+        for field_name, item in client_data.items():
+            if field_name not in columns or not isinstance(item, dict):
+                skipped.append(field_name)
+                continue
+
+            field_type = item.get("type")
+            value = item.get("value")
+            if field_type == "many2one" and value:
+                relation = str(item.get("relation") or "")
+                relation_table = relation.replace(".", "_")
+                try:
+                    relation_id = int(value)
+                except (TypeError, ValueError):
+                    skipped.append(field_name)
+                    continue
+                if (
+                    not re.fullmatch(r"[a-z_][a-z0-9_]*", relation_table)
+                    or not self._table_exists(relation_table, database_name)
+                    or not self._record_exists(
+                        relation_table,
+                        relation_id,
+                        database_name,
+                    )
+                ):
+                    skipped.append(field_name)
+                    continue
+
+            if value is None:
+                literal = "NULL"
+            elif isinstance(value, bool):
+                literal = "TRUE" if value else "FALSE"
+            else:
+                literal = self._sql_literal(value)
+            assignments.append(
+                f"{self._sql_identifier(field_name)} = {literal}"
+            )
+            applied.append(field_name)
+
+        if assignments:
+            sql = (
+                "UPDATE \"res_partner\" SET "
+                + ", ".join(assignments)
+                + f" WHERE id = {target_id};"
+            )
+            run(
+                [
+                    "runuser", "-u", "postgres", "--", "psql",
+                    "-v", "ON_ERROR_STOP=1", "-d", database_name, "-c", sql,
+                ],
+                timeout=120,
+            )
+        return {"applied": applied, "skipped": skipped}
+
     # =========================================================
     # POSTGRESQL
     # =========================================================
@@ -1595,6 +1722,18 @@ class DatabaseManager:
                 target_domain,
             )
 
+            client_data_result = {"applied": [], "skipped": []}
+            if payload.get("copy_client_to_database"):
+                progress(
+                    "client_data",
+                    70,
+                    "Copiando información del cliente al contacto principal...",
+                )
+                client_data_result = self._copy_client_to_main_partner(
+                    database_name,
+                    payload.get("client_data") or {},
+                )
+
             # -------------------------------------------------
             # 6. FILESTORE
             # -------------------------------------------------
@@ -1742,6 +1881,7 @@ class DatabaseManager:
                     ),
                     "filestore_owner": filestore_owner_verified,
                     "postgres_auth": postgres_auth_verified,
+                    "client_data": client_data_result,
                 },
                 "config_path": (
                     str(config_path)
