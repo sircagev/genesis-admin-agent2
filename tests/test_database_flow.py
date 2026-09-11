@@ -349,6 +349,7 @@ class ProvisioningContractTest(unittest.TestCase):
 
         self.assertIn("server 127.0.0.1:8069;", config)
         self.assertIn("server 127.0.0.1:8070;", config)
+        self.assertIn("client_max_body_size 100M;", config)
         self.assertIn("location /websocket", config)
         self.assertIn("proxy_http_version 1.1;", config)
         self.assertIn("proxy_set_header Upgrade $http_upgrade;", config)
@@ -359,6 +360,24 @@ class ProvisioningContractTest(unittest.TestCase):
         self.assertTrue(
             provisioner._validate_nginx_conf(config, payload, "customer")
         )
+
+    def test_nginx_validation_requires_100_mb_body_limit(self):
+        provisioner = self._provisioner()
+        payload = {
+            **self._payload(),
+            "domain": "customer.example.com",
+        }
+        config = provisioner._nginx_conf(payload, "customer").replace(
+            "client_max_body_size 100M;",
+            "",
+            1,
+        )
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "límite de carga de 100 MB",
+        ):
+            provisioner._validate_nginx_conf(config, payload, "customer")
 
     def test_nginx_validation_rejects_incomplete_websocket_proxy(self):
         provisioner = self._provisioner()

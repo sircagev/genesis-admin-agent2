@@ -2233,6 +2233,7 @@ class OdooProvisioner:
             server {{
                 listen 80;
                 server_name {domain};
+                client_max_body_size 100M;
 
                 proxy_read_timeout 720s;
                 proxy_connect_timeout 720s;
@@ -2306,6 +2307,7 @@ class OdooProvisioner:
         )
 
         required = [
+            (config, r"client_max_body_size\s+100M\s*;", "límite de carga de 100 MB"),
             (main_upstream, rf"127\.0\.0\.1:{int(payload['http_port'])}\s*;", "puerto HTTP"),
             (chat_upstream, rf"127\.0\.0\.1:{int(payload['gevent_port'])}\s*;", "puerto gevent"),
             (websocket, rf"proxy_pass\s+http://{re.escape(chat)}\s*;", "proxy WebSocket"),
