@@ -180,7 +180,7 @@ class DatabaseManager:
             result.get("success") and (result.get("output") or "").strip() == "1"
         )
 
-    def _copy_client_to_main_partner(self, database_name, client_data):
+    def _copy_client_to_primary_company_partner(self, database_name, client_data):
         if not isinstance(client_data, dict):
             return {"applied": [], "skipped": []}
 
@@ -201,8 +201,9 @@ class DatabaseManager:
             [
                 "runuser", "-u", "postgres", "--", "psql", "-At", "-d",
                 database_name, "-c",
-                "SELECT res_id FROM ir_model_data WHERE module = 'base' "
-                "AND name = 'main_partner' AND model = 'res.partner' LIMIT 1;",
+                "SELECT partner_id FROM res_company "
+                "WHERE partner_id IS NOT NULL "
+                "ORDER BY create_date ASC NULLS LAST, id ASC LIMIT 1;",
             ],
             check=False,
             timeout=30,
@@ -1727,9 +1728,9 @@ class DatabaseManager:
                 progress(
                     "client_data",
                     70,
-                    "Copiando información del cliente al contacto principal...",
+                    "Copiando información del cliente al partner de la empresa principal...",
                 )
-                client_data_result = self._copy_client_to_main_partner(
+                client_data_result = self._copy_client_to_primary_company_partner(
                     database_name,
                     payload.get("client_data") or {},
                 )

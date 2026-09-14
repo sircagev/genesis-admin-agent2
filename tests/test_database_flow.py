@@ -251,6 +251,44 @@ class InventoryProgressTest(unittest.TestCase):
         )
 
 
+class ClientCopyDestinationTest(unittest.TestCase):
+    def test_copy_uses_partner_of_first_created_company(self):
+        manager = DatabaseManager.__new__(DatabaseManager)
+        commands = []
+
+        def fake_run(command, **_kwargs):
+            commands.append(command)
+            query = command[-1]
+            if "information_schema.columns" in query:
+                return {"success": True, "output": "name\nphone\n"}
+            if "FROM res_company" in query:
+                return {"success": True, "output": "37\n"}
+            return {"success": True, "output": ""}
+
+        with patch("agent.database_manager.run", side_effect=fake_run):
+            result = manager._copy_client_to_primary_company_partner(
+                "target_database",
+                {
+                    "name": {"type": "char", "value": "Cliente solicitado"},
+                    "phone": {"type": "char", "value": "+57 300 000 0000"},
+                },
+            )
+
+        company_query = next(
+            command[-1] for command in commands if "FROM res_company" in command[-1]
+        )
+        update_query = next(
+            command[-1] for command in commands if command[-1].startswith("UPDATE")
+        )
+        self.assertIn(
+            "ORDER BY create_date ASC NULLS LAST, id ASC",
+            company_query,
+        )
+        self.assertNotIn("ir_model_data", company_query)
+        self.assertIn("WHERE id = 37", update_query)
+        self.assertEqual(result["applied"], ["name", "phone"])
+
+
 class DatabaseRestoreStreamTest(unittest.TestCase):
     def test_pg_restore_reads_private_dump_through_stdin(self):
         captured = {}
