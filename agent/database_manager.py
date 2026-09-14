@@ -184,38 +184,83 @@ class DatabaseManager:
         if not isinstance(client_data, dict):
             return {"applied": [], "skipped": []}
 
+        allowed_fields = {
+            "name",
+            "image_1920",
+            "vat",
+            "l10n_latam_identification_type_id",
+            "street",
+            "street2",
+            "city",
+            "city_id",
+            "state_id",
+            "country_id",
+            "zip",
+        }
+
+        # Solo aceptar los campos que realmente queremos copiar.
+        client_data = {
+            name: item
+            for name, item in client_data.items()
+            if name in allowed_fields
+        }
+
+        if not client_data:
+            return {"applied": [], "skipped": []}
+
         result = run(
             [
-                "runuser", "-u", "postgres", "--", "psql", "-At", "-F", "\t",
-                "-d", database_name, "-c",
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = 'res_partner';",
+                "runuser", "-u", "postgres", "--",
+                "psql", "-At", "-F", "\t",
+                "-d", database_name,
+                "-c",
+                "SELECT column_name "
+                "FROM information_schema.columns "
+                "WHERE table_schema = 'public' "
+                "AND table_name = 'res_partner';",
             ],
             timeout=30,
         )
-        columns = set((result.get("output") or "").splitlines())
-        if not columns:
-            return {"applied": [], "skipped": list(client_data)}
 
+        columns = set((result.get("output") or "").splitlines())
+
+        if not columns:
+            return {
+                "applied": [],
+                "skipped": list(client_data),
+            }
+
+        # Buscar el partner de la primera compañía de la base restaurada.
         target_id_result = run(
             [
-                "runuser", "-u", "postgres", "--", "psql", "-At", "-d",
-                database_name, "-c",
-                "SELECT partner_id FROM res_company "
+                "runuser", "-u", "postgres", "--",
+                "psql", "-At",
+                "-d", database_name,
+                "-c",
+                "SELECT partner_id "
+                "FROM res_company "
                 "WHERE partner_id IS NOT NULL "
-                "ORDER BY create_date ASC NULLS LAST, id ASC LIMIT 1;",
+                "ORDER BY create_date ASC NULLS LAST, id ASC "
+                "LIMIT 1;",
             ],
             check=False,
             timeout=30,
         )
+
         try:
-            target_id = int((target_id_result.get("output") or "").strip())
+            target_id = int(
+                (target_id_result.get("output") or "").strip()
+            )
         except (TypeError, ValueError):
-            return {"applied": [], "skipped": list(client_data)}
+            return {
+                "applied": [],
+                "skipped": list(client_data),
+            }
 
         assignments = []
         applied = []
         skipped = []
+
         for field_name, item in client_data.items():
             if field_name not in columns or not isinstance(item, dict):
                 skipped.append(field_name)
@@ -223,35 +268,66 @@ class DatabaseManager:
 
             field_type = item.get("type")
             value = item.get("value")
-            if field_type == "many2one" and value:
-                relation = str(item.get("relation") or "")
-                relation_table = relation.replace(".", "_")
-                try:
-                    relation_id = int(value)
-                except (TypeError, ValueError):
-                    skipped.append(field_name)
-                    continue
-                if (
-                    not re.fullmatch(r"[a-z_][a-z0-9_]*", relation_table)
-                    or not self._table_exists(relation_table, database_name)
-                    or not self._record_exists(
-                        relation_table,
-                        relation_id,
-                        database_name,
-                    )
-                ):
-                    skipped.append(field_name)
-                    continue
 
-            if value is None:
+            # -------------------------
+            # MANY2ONE
+            # -------------------------
+            if field_type == "many2one":
+                if not value:
+                    literal = "NULL"
+                else:
+                    relation = str(item.get("relation") or "")
+                    relation_table = relation.replace(".", "_")
+
+                    try:
+                        relation_id = int(value)
+                    except (TypeError, ValueError):
+                        skipped.append(field_name)
+                        continue
+
+                    if (
+                        not re.fullmatch(
+                            r"[a-z_][a-z0-9_]*",
+                            relation_table,
+                        )
+                        or not self._table_exists(
+                            relation_table,
+                            database_name,
+                        )
+                        or not self._record_exists(
+                            relation_table,
+                            relation_id,
+                            database_name,
+                        )
+                    ):
+                        skipped.append(field_name)
+                        continue
+
+                    literal = str(relation_id)
+
+            # -------------------------
+            # VALORES VACÍOS
+            # -------------------------
+            elif value is None or value is False:
                 literal = "NULL"
-            elif isinstance(value, bool):
+
+            # -------------------------
+            # BOOLEAN
+            # -------------------------
+            elif field_type == "boolean":
                 literal = "TRUE" if value else "FALSE"
+
+            # -------------------------
+            # RESTO
+            # char, text, binary, etc.
+            # -------------------------
             else:
                 literal = self._sql_literal(value)
+
             assignments.append(
                 f"{self._sql_identifier(field_name)} = {literal}"
             )
+
             applied.append(field_name)
 
         if assignments:
@@ -260,14 +336,22 @@ class DatabaseManager:
                 + ", ".join(assignments)
                 + f" WHERE id = {target_id};"
             )
+
             run(
                 [
-                    "runuser", "-u", "postgres", "--", "psql",
-                    "-v", "ON_ERROR_STOP=1", "-d", database_name, "-c", sql,
+                    "runuser", "-u", "postgres", "--",
+                    "psql",
+                    "-v", "ON_ERROR_STOP=1",
+                    "-d", database_name,
+                    "-c", sql,
                 ],
                 timeout=120,
             )
-        return {"applied": applied, "skipped": skipped}
+
+        return {
+            "applied": applied,
+            "skipped": skipped,
+        }
 
     # =========================================================
     # POSTGRESQL
