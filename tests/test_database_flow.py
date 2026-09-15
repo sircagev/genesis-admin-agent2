@@ -262,7 +262,7 @@ class ClientCopyDestinationTest(unittest.TestCase):
             commands.append(command)
             query = command[-1]
             if "information_schema.columns" in query:
-                return {"success": True, "output": "name\nvat\n"}
+                return {"success": True, "output": "name\nvat\nemail\nphone\nis_company\ndeclarant_condition\nl10n_co_edi_large_taxpayer\nl10n_co_edi_fiscal_regimen\nl10n_co_edi_commercial_name\n"}
             if "FROM res_company" in query:
                 return {"success": True, "output": "11\t37\n"}
             return {"success": True, "output": ""}
@@ -273,6 +273,14 @@ class ClientCopyDestinationTest(unittest.TestCase):
                 {
                     "name": {"type": "char", "value": "Cliente solicitado"},
                     "vat": {"type": "char", "value": "900000000"},
+                    "email": {"type": "char", "value": "cliente@example.com"},
+                    "phone": {"type": "char", "value": "+57 3000000000"},
+                    "is_company": {"type": "boolean", "value": True},
+                    "declarant_condition": {"type": "selection", "value": "non_declarant"},
+                    "l10n_co_edi_large_taxpayer": {"type": "boolean", "value": False},
+                    "l10n_co_edi_fiscal_regimen": {"type": "selection", "value": "48"},
+                    "l10n_co_edi_commercial_name": {"type": "char", "value": "Cliente Comercial"},
+                    "l10n_co_edi_obligation_type_ids": {"type": "many2many", "value": []},
                     "image_1920": {"type": "binary", "value": "YWJj"},
                 },
             )
@@ -296,10 +304,19 @@ class ClientCopyDestinationTest(unittest.TestCase):
         self.assertIn("WHERE id = 37", update_query)
         self.assertIn("SET name = 'Cliente solicitado'", company_update_query)
         self.assertIn("WHERE id = 11", company_update_query)
-        self.assertEqual(result["applied"], ["name", "vat"])
+        self.assertEqual(
+            result["applied"],
+            [
+                "name", "vat", "email", "phone", "is_company",
+                "declarant_condition", "l10n_co_edi_large_taxpayer",
+                "l10n_co_edi_fiscal_regimen",
+                "l10n_co_edi_commercial_name",
+            ],
+        )
         self.assertEqual(result["target_company_id"], 11)
         self.assertEqual(result["target_partner_id"], 37)
         self.assertNotIn("image_1920", result["skipped"])
+        self.assertNotIn("l10n_co_edi_obligation_type_ids", result["skipped"])
 
     def test_image_copy_uses_odoo_shell_without_base64_in_command(self):
         manager = DatabaseManager.__new__(DatabaseManager)
@@ -337,6 +354,13 @@ class ClientCopyDestinationTest(unittest.TestCase):
                 unit="odoo-server-customer.service",
                 system_user="odoo",
                 config_path="/etc/odoocustomer.conf",
+                obligation_types=[
+                    {
+                        "xml_id": "l10n_co_edi.obligation_type_5",
+                        "name": "R-99-PN",
+                        "description": "No aplica - Otros",
+                    }
+                ],
             )
 
         command = captured["command"]
@@ -348,6 +372,7 @@ class ClientCopyDestinationTest(unittest.TestCase):
         self.assertNotIn(image_base64, script)
         self.assertIn("partner.write", script)
         self.assertIn("env.cr.commit()", script)
+        self.assertIn("l10n_co_edi_obligation_type_ids", script)
 
 
 class DatabaseRestoreStreamTest(unittest.TestCase):

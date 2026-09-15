@@ -239,18 +239,27 @@ class DatabaseManager:
         unit,
         system_user,
         config_path,
+        obligation_types=None,
     ):
         database_name = self._validate_database_name(database_name)
         try:
             partner_id = int(partner_id)
         except (TypeError, ValueError) as exc:
             raise CommandError(
-                "El partner destino para la imagen no es válido."
+                "El partner destino para los datos ORM no es válido."
             ) from exc
         if partner_id <= 0:
-            raise CommandError("El partner destino para la imagen no es válido.")
-        if not isinstance(image_base64, str) or not image_base64.strip():
+            raise CommandError(
+                "El partner destino para los datos ORM no es válido."
+            )
+        if image_base64 and (
+            not isinstance(image_base64, str) or not image_base64.strip()
+        ):
             raise CommandError("La imagen del cliente no contiene Base64 válido.")
+        if obligation_types is not None and not isinstance(obligation_types, list):
+            raise CommandError("Las obligaciones fiscales del cliente no son válidas.")
+        if not image_base64 and obligation_types is None:
+            return
 
         runtime = self._service_odoo_runtime(unit, config_path)
         try:
@@ -260,30 +269,69 @@ class DatabaseManager:
                 "No existe el usuario del servicio Odoo destino."
             ) from exc
 
-        image_path = None
+        payload_path = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
-                prefix="genesis-client-image-",
+                prefix="genesis-client-orm-",
                 dir="/tmp",
                 delete=False,
             ) as handle:
-                handle.write(image_base64)
-                image_path = Path(handle.name)
-            os.chmod(image_path, 0o600)
-            os.chown(image_path, account.pw_uid, account.pw_gid)
+                json.dump(
+                    {
+                        "image_1920": image_base64,
+                        "obligation_types": obligation_types,
+                    },
+                    handle,
+                )
+                payload_path = Path(handle.name)
+            os.chmod(payload_path, 0o600)
+            os.chown(payload_path, account.pw_uid, account.pw_gid)
 
             script = (
                 "from pathlib import Path\n"
-                f"image_base64 = Path({str(image_path)!r}).read_text(encoding=\"utf-8\")\n"
+                "import json\n"
+                f"payload = json.loads(Path({str(payload_path)!r}).read_text(encoding=\"utf-8\"))\n"
                 f"partner = env[\"res.partner\"].browse({partner_id})\n"
                 "if not partner.exists():\n"
                 "    raise RuntimeError(\"El partner destino no existe.\")\n"
-                "partner.write({\"image_1920\": image_base64})\n"
+                "values = {}\n"
+                "image_base64 = payload.get(\"image_1920\")\n"
+                "if image_base64:\n"
+                "    values[\"image_1920\"] = image_base64\n"
+                "obligation_types = payload.get(\"obligation_types\")\n"
+                "if obligation_types is not None:\n"
+                "    field_name = \"l10n_co_edi_obligation_type_ids\"\n"
+                "    if field_name not in partner._fields:\n"
+                "        raise RuntimeError(\"El destino no dispone del campo de obligaciones fiscales.\")\n"
+                "    obligation_model = env[\"l10n_co_edi.type_code\"]\n"
+                "    obligations = obligation_model.browse()\n"
+                "    for item in obligation_types:\n"
+                "        if not isinstance(item, dict):\n"
+                "            raise RuntimeError(\"Una obligación fiscal no es válida.\")\n"
+                "        xml_id = item.get(\"xml_id\")\n"
+                "        obligation = env.ref(xml_id, raise_if_not_found=False) if xml_id else obligation_model.browse()\n"
+                "        if obligation and obligation._name != obligation_model._name:\n"
+                "            raise RuntimeError(\"El identificador de obligación fiscal no corresponde al catálogo destino.\")\n"
+                "        if not obligation:\n"
+                "            domain = [(\"name\", \"=\", item.get(\"name\"))]\n"
+                "            if item.get(\"description\"):\n"
+                "                domain.append((\"description\", \"=\", item[\"description\"]))\n"
+                "            matches = obligation_model.search(domain, limit=2)\n"
+                "            if len(matches) != 1:\n"
+                "                raise RuntimeError(\"No fue posible identificar una obligación fiscal en el destino.\")\n"
+                "            obligation = matches\n"
+                "        obligations |= obligation\n"
+                "    values[field_name] = [(6, 0, obligations.ids)]\n"
+                "if not values:\n"
+                "    raise RuntimeError(\"No hay datos ORM del cliente para copiar.\")\n"
+                "partner.write(values)\n"
                 "env.cr.commit()\n"
-                "if not partner.image_1920:\n"
+                "if image_base64 and not partner.image_1920:\n"
                 "    raise RuntimeError(\"La imagen no quedó almacenada.\")\n"
+                "if obligation_types is not None and set(partner.l10n_co_edi_obligation_type_ids.ids) != set(obligations.ids):\n"
+                "    raise RuntimeError(\"Las obligaciones fiscales no quedaron almacenadas.\")\n"
             )
             result = run(
                 [
@@ -299,12 +347,12 @@ class DatabaseManager:
             if not result.get("success"):
                 detail = str(result.get("output") or "").strip()[-2000:]
                 raise CommandError(
-                    "No fue posible copiar image_1920 mediante Odoo ORM."
+                    "No fue posible copiar los datos ORM del cliente."
                     + (f" Detalle: {detail}" if detail else "")
                 )
         finally:
-            if image_path:
-                image_path.unlink(missing_ok=True)
+            if payload_path:
+                payload_path.unlink(missing_ok=True)
 
     def _copy_client_to_primary_company_partner(self, database_name, client_data):
         if not isinstance(client_data, dict):
@@ -313,8 +361,17 @@ class DatabaseManager:
         allowed_fields = {
             "name",
             "image_1920",
+            "email",
+            "phone",
+            "is_company",
             "vat",
             "l10n_latam_identification_type_id",
+            "property_account_position_id",
+            "declarant_condition",
+            "l10n_co_edi_large_taxpayer",
+            "l10n_co_edi_fiscal_regimen",
+            "l10n_co_edi_commercial_name",
+            "l10n_co_edi_obligation_type_ids",
             "street",
             "street2",
             "city",
@@ -337,7 +394,7 @@ class DatabaseManager:
         sql_client_data = {
             name: item
             for name, item in client_data.items()
-            if name != "image_1920"
+            if name not in {"image_1920", "l10n_co_edi_obligation_type_ids"}
         }
 
         result = run(
@@ -1970,6 +2027,7 @@ class DatabaseManager:
                 "target_company_id": False, "target_partner_id": False,
             }
             client_image = False
+            client_obligation_types = None
             if payload.get("copy_client_to_database"):
                 client_data = payload.get("client_data") or {}
                 if not isinstance(client_data, dict):
@@ -1977,6 +2035,9 @@ class DatabaseManager:
                 image_item = client_data.get("image_1920")
                 if isinstance(image_item, dict):
                     client_image = image_item.get("value")
+                obligation_item = client_data.get("l10n_co_edi_obligation_type_ids")
+                if isinstance(obligation_item, dict):
+                    client_obligation_types = obligation_item.get("value")
                 progress(
                     "client_data",
                     70,
@@ -2069,17 +2130,17 @@ class DatabaseManager:
                         "con el servicio destino."
                     )
 
-            if client_image:
+            if client_image or client_obligation_types is not None:
                 target_partner_id = client_data_result.get("target_partner_id")
                 if not target_partner_id:
                     raise CommandError(
                         "No fue posible identificar el partner destino para "
-                        "copiar image_1920."
+                        "copiar los datos ORM del cliente."
                     )
                 progress(
                     "client_image",
                     85,
-                    "Copiando image_1920 mediante Odoo ORM...",
+                    "Copiando los datos ORM del cliente...",
                 )
                 self._copy_client_image_with_odoo(
                     database_name=database_name,
@@ -2088,8 +2149,14 @@ class DatabaseManager:
                     unit=unit,
                     system_user=system_user,
                     config_path=config_path,
+                    obligation_types=client_obligation_types,
                 )
-                client_data_result["applied"].append("image_1920")
+                if client_image:
+                    client_data_result["applied"].append("image_1920")
+                if client_obligation_types is not None:
+                    client_data_result["applied"].append(
+                        "l10n_co_edi_obligation_type_ids"
+                    )
 
             # El propietario y la autenticación TCP se verificaron antes
             # de sanitizar la identidad de la plantilla.
