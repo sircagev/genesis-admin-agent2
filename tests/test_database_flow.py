@@ -1,7 +1,9 @@
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.client import ControllerClient
@@ -260,9 +262,9 @@ class ClientCopyDestinationTest(unittest.TestCase):
             commands.append(command)
             query = command[-1]
             if "information_schema.columns" in query:
-                return {"success": True, "output": "name\nphone\n"}
+                return {"success": True, "output": "name\nvat\n"}
             if "FROM res_company" in query:
-                return {"success": True, "output": "37\n"}
+                return {"success": True, "output": "11\t37\n"}
             return {"success": True, "output": ""}
 
         with patch("agent.database_manager.run", side_effect=fake_run):
@@ -270,7 +272,8 @@ class ClientCopyDestinationTest(unittest.TestCase):
                 "target_database",
                 {
                     "name": {"type": "char", "value": "Cliente solicitado"},
-                    "phone": {"type": "char", "value": "+57 300 000 0000"},
+                    "vat": {"type": "char", "value": "900000000"},
+                    "image_1920": {"type": "binary", "value": "YWJj"},
                 },
             )
 
@@ -280,13 +283,71 @@ class ClientCopyDestinationTest(unittest.TestCase):
         update_query = next(
             command[-1] for command in commands if command[-1].startswith("UPDATE")
         )
+        company_update_query = next(
+            command[-1]
+            for command in commands
+            if command[-1].startswith("UPDATE \"res_company\"")
+        )
         self.assertIn(
             "ORDER BY create_date ASC NULLS LAST, id ASC",
             company_query,
         )
         self.assertNotIn("ir_model_data", company_query)
         self.assertIn("WHERE id = 37", update_query)
-        self.assertEqual(result["applied"], ["name", "phone"])
+        self.assertIn("SET name = 'Cliente solicitado'", company_update_query)
+        self.assertIn("WHERE id = 11", company_update_query)
+        self.assertEqual(result["applied"], ["name", "vat"])
+        self.assertEqual(result["target_company_id"], 11)
+        self.assertEqual(result["target_partner_id"], 37)
+        self.assertNotIn("image_1920", result["skipped"])
+
+    def test_image_copy_uses_odoo_shell_without_base64_in_command(self):
+        manager = DatabaseManager.__new__(DatabaseManager)
+        image_base64 = "cHJpdmF0ZS1pbWFnZS1kYXRh"
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return {"success": True, "output": ""}
+
+        runtime = {
+            "python": Path("/opt/customer/customerenv/bin/python"),
+            "odoo_bin": Path("/opt/customer/odoo-server/odoo-bin"),
+            "config": Path("/etc/odoocustomer.conf"),
+        }
+        account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+        with patch.object(
+            manager,
+            "_service_odoo_runtime",
+            return_value=runtime,
+        ), patch(
+            "agent.database_manager.pwd.getpwnam",
+            return_value=account,
+        ), patch(
+            "agent.database_manager.os.chown"
+        ), patch(
+            "agent.database_manager.run",
+            side_effect=fake_run,
+        ):
+            manager._copy_client_image_with_odoo(
+                database_name="target_database",
+                partner_id=37,
+                image_base64=image_base64,
+                unit="odoo-server-customer.service",
+                system_user="odoo",
+                config_path="/etc/odoocustomer.conf",
+            )
+
+        command = captured["command"]
+        script = captured["kwargs"]["input_data"]
+        self.assertEqual(command[:4], ["runuser", "-u", "odoo", "--"])
+        self.assertIn("shell", command)
+        self.assertIn("--no-http", command)
+        self.assertNotIn(image_base64, " ".join(command))
+        self.assertNotIn(image_base64, script)
+        self.assertIn("partner.write", script)
+        self.assertIn("env.cr.commit()", script)
 
 
 class DatabaseRestoreStreamTest(unittest.TestCase):

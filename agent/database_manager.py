@@ -5,6 +5,7 @@ import os
 import pwd
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -149,13 +150,15 @@ class DatabaseManager:
         return f'"{value}"'
 
     def _table_exists(self, table_name, database_name):
-        table_name = self._sql_identifier(table_name)
+        table_name = str(table_name or "")
+        self._sql_identifier(table_name)
         result = run(
             [
                 "runuser", "-u", "postgres", "--", "psql", "-At",
                 "-d", database_name, "-c",
-                "SELECT to_regclass('public.' || "
-                f"{self._sql_literal(table_name)});",
+                "SELECT to_regclass("
+                f"{self._sql_literal(f'public.{table_name}')}"
+                ");",
             ],
             check=False,
             timeout=30,
@@ -180,9 +183,132 @@ class DatabaseManager:
             result.get("success") and (result.get("output") or "").strip() == "1"
         )
 
+    def _service_odoo_runtime(self, unit, config_path):
+        unit = self._validate_unit(unit)
+        result = run(
+            [
+                "systemctl", "show", unit, "--no-pager",
+                "--property=ExecStart",
+            ],
+            check=False,
+            timeout=30,
+        )
+        if not result.get("success"):
+            raise CommandError(
+                "No fue posible leer el ejecutable del servicio Odoo destino."
+            )
+
+        exec_start = str(result.get("output") or "")
+        python_path = ""
+        odoo_bin = ""
+        match = re.search(r"(?:^|\s)path=([^ ;]+)", exec_start)
+        if match:
+            python_path = match.group(1)
+        argv_match = re.search(r"argv\[\]=(.+?)\s;\s", exec_start)
+        argv_text = argv_match.group(1) if argv_match else exec_start
+        try:
+            arguments = shlex.split(argv_text)
+        except ValueError:
+            arguments = argv_text.split()
+        for value in arguments:
+            if value.endswith("/odoo-bin"):
+                odoo_bin = value
+                break
+        if not python_path and arguments:
+            python_path = arguments[0]
+
+        python = Path(python_path)
+        executable = Path(odoo_bin).resolve()
+        config = Path(config_path).resolve()
+        if not python.is_file() or not executable.is_file() or not config.is_file():
+            raise CommandError(
+                "No se pudieron validar Python, odoo-bin y configuración "
+                "del servicio Odoo destino."
+            )
+        return {
+            "python": python,
+            "odoo_bin": executable,
+            "config": config,
+        }
+
+    def _copy_client_image_with_odoo(
+        self,
+        database_name,
+        partner_id,
+        image_base64,
+        unit,
+        system_user,
+        config_path,
+    ):
+        database_name = self._validate_database_name(database_name)
+        try:
+            partner_id = int(partner_id)
+        except (TypeError, ValueError) as exc:
+            raise CommandError(
+                "El partner destino para la imagen no es válido."
+            ) from exc
+        if partner_id <= 0:
+            raise CommandError("El partner destino para la imagen no es válido.")
+        if not isinstance(image_base64, str) or not image_base64.strip():
+            raise CommandError("La imagen del cliente no contiene Base64 válido.")
+
+        runtime = self._service_odoo_runtime(unit, config_path)
+        try:
+            account = pwd.getpwnam(system_user)
+        except KeyError as exc:
+            raise CommandError(
+                "No existe el usuario del servicio Odoo destino."
+            ) from exc
+
+        image_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="genesis-client-image-",
+                dir="/tmp",
+                delete=False,
+            ) as handle:
+                handle.write(image_base64)
+                image_path = Path(handle.name)
+            os.chmod(image_path, 0o600)
+            os.chown(image_path, account.pw_uid, account.pw_gid)
+
+            script = (
+                "from pathlib import Path\n"
+                f"image_base64 = Path({str(image_path)!r}).read_text(encoding=\"utf-8\")\n"
+                f"partner = env[\"res.partner\"].browse({partner_id})\n"
+                "if not partner.exists():\n"
+                "    raise RuntimeError(\"El partner destino no existe.\")\n"
+                "partner.write({\"image_1920\": image_base64})\n"
+                "env.cr.commit()\n"
+                "if not partner.image_1920:\n"
+                "    raise RuntimeError(\"La imagen no quedó almacenada.\")\n"
+            )
+            result = run(
+                [
+                    "runuser", "-u", system_user, "--",
+                    str(runtime["python"]), str(runtime["odoo_bin"]),
+                    "shell", "-c", str(runtime["config"]),
+                    "-d", database_name, "--no-http",
+                ],
+                check=False,
+                timeout=600,
+                input_data=script,
+            )
+            if not result.get("success"):
+                detail = str(result.get("output") or "").strip()[-2000:]
+                raise CommandError(
+                    "No fue posible copiar image_1920 mediante Odoo ORM."
+                    + (f" Detalle: {detail}" if detail else "")
+                )
+        finally:
+            if image_path:
+                image_path.unlink(missing_ok=True)
+
     def _copy_client_to_primary_company_partner(self, database_name, client_data):
         if not isinstance(client_data, dict):
-            return {"applied": [], "skipped": []}
+            return {"applied": [], "skipped": [], "target_company_id": False, "target_partner_id": False}
 
         allowed_fields = {
             "name",
@@ -206,7 +332,13 @@ class DatabaseManager:
         }
 
         if not client_data:
-            return {"applied": [], "skipped": []}
+            return {"applied": [], "skipped": [], "target_company_id": False, "target_partner_id": False}
+
+        sql_client_data = {
+            name: item
+            for name, item in client_data.items()
+            if name != "image_1920"
+        }
 
         result = run(
             [
@@ -227,17 +359,18 @@ class DatabaseManager:
         if not columns:
             return {
                 "applied": [],
-                "skipped": list(client_data),
+                "skipped": list(sql_client_data),
+                "target_company_id": False, "target_partner_id": False,
             }
 
         # Buscar el partner de la primera compañía de la base restaurada.
         target_id_result = run(
             [
                 "runuser", "-u", "postgres", "--",
-                "psql", "-At",
+                "psql", "-At", "-F", "\t",
                 "-d", database_name,
                 "-c",
-                "SELECT partner_id "
+                "SELECT id, partner_id "
                 "FROM res_company "
                 "WHERE partner_id IS NOT NULL "
                 "ORDER BY create_date ASC NULLS LAST, id ASC "
@@ -247,21 +380,23 @@ class DatabaseManager:
             timeout=30,
         )
 
+        target_parts = (target_id_result.get("output") or "").strip().split("\t")
         try:
-            target_id = int(
-                (target_id_result.get("output") or "").strip()
-            )
-        except (TypeError, ValueError):
+            target_company_id = int(target_parts[0])
+            target_partner_id = int(target_parts[1])
+        except (IndexError, TypeError, ValueError):
             return {
                 "applied": [],
-                "skipped": list(client_data),
+                "skipped": list(sql_client_data),
+                "target_company_id": False, "target_partner_id": False,
             }
 
         assignments = []
         applied = []
         skipped = []
+        company_name_literal = None
 
-        for field_name, item in client_data.items():
+        for field_name, item in sql_client_data.items():
             if field_name not in columns or not isinstance(item, dict):
                 skipped.append(field_name)
                 continue
@@ -328,13 +463,16 @@ class DatabaseManager:
                 f"{self._sql_identifier(field_name)} = {literal}"
             )
 
+            if field_name == "name":
+                company_name_literal = literal
+
             applied.append(field_name)
 
         if assignments:
             sql = (
                 "UPDATE \"res_partner\" SET "
                 + ", ".join(assignments)
-                + f" WHERE id = {target_id};"
+                + f" WHERE id = {target_partner_id};"
             )
 
             run(
@@ -348,9 +486,28 @@ class DatabaseManager:
                 timeout=120,
             )
 
+        if company_name_literal is not None:
+            company_sql = (
+                "UPDATE \"res_company\" SET name = "
+                + company_name_literal
+                + f" WHERE id = {target_company_id};"
+            )
+            run(
+                [
+                    "runuser", "-u", "postgres", "--",
+                    "psql",
+                    "-v", "ON_ERROR_STOP=1",
+                    "-d", database_name,
+                    "-c", company_sql,
+                ],
+                timeout=120,
+            )
+
         return {
             "applied": applied,
             "skipped": skipped,
+            "target_company_id": target_company_id,
+            "target_partner_id": target_partner_id,
         }
 
     # =========================================================
@@ -1779,7 +1936,7 @@ class DatabaseManager:
                 self.provisioner.pcfg.get("postgres_validate_auth"), True
             ):
                 progress(
-                    "postgres_auth",
+                    "restore_postgres_auth",
                     60,
                     "Validando autenticación TCP de la base restaurada...",
                 )
@@ -1807,8 +1964,19 @@ class DatabaseManager:
                 target_domain,
             )
 
-            client_data_result = {"applied": [], "skipped": []}
+            client_data_result = {
+                "applied": [],
+                "skipped": [],
+                "target_company_id": False, "target_partner_id": False,
+            }
+            client_image = False
             if payload.get("copy_client_to_database"):
+                client_data = payload.get("client_data") or {}
+                if not isinstance(client_data, dict):
+                    client_data = {}
+                image_item = client_data.get("image_1920")
+                if isinstance(image_item, dict):
+                    client_image = image_item.get("value")
                 progress(
                     "client_data",
                     70,
@@ -1816,7 +1984,7 @@ class DatabaseManager:
                 )
                 client_data_result = self._copy_client_to_primary_company_partner(
                     database_name,
-                    payload.get("client_data") or {},
+                    client_data,
                 )
 
             # -------------------------------------------------
@@ -1900,6 +2068,28 @@ class DatabaseManager:
                         "El propietario final del filestore no coincide "
                         "con el servicio destino."
                     )
+
+            if client_image:
+                target_partner_id = client_data_result.get("target_partner_id")
+                if not target_partner_id:
+                    raise CommandError(
+                        "No fue posible identificar el partner destino para "
+                        "copiar image_1920."
+                    )
+                progress(
+                    "client_image",
+                    85,
+                    "Copiando image_1920 mediante Odoo ORM...",
+                )
+                self._copy_client_image_with_odoo(
+                    database_name=database_name,
+                    partner_id=target_partner_id,
+                    image_base64=client_image,
+                    unit=unit,
+                    system_user=system_user,
+                    config_path=config_path,
+                )
+                client_data_result["applied"].append("image_1920")
 
             # El propietario y la autenticación TCP se verificaron antes
             # de sanitizar la identidad de la plantilla.
