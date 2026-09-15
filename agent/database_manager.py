@@ -498,16 +498,16 @@ class DatabaseManager:
                     literal = str(relation_id)
 
             # -------------------------
-            # VALORES VACÍOS
-            # -------------------------
-            elif value is None or value is False:
-                literal = "NULL"
-
-            # -------------------------
             # BOOLEAN
             # -------------------------
             elif field_type == "boolean":
                 literal = "TRUE" if value else "FALSE"
+
+            # -------------------------
+            # VALORES VACÍOS
+            # -------------------------
+            elif value is None or value is False:
+                literal = "NULL"
 
             # -------------------------
             # RESTO
@@ -522,6 +522,10 @@ class DatabaseManager:
 
             if field_name == "name":
                 company_name_literal = literal
+                if "complete_name" in columns:
+                    assignments.append(
+                        f"{self._sql_identifier('complete_name')} = {literal}"
+                    )
 
             applied.append(field_name)
 

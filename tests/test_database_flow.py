@@ -262,7 +262,7 @@ class ClientCopyDestinationTest(unittest.TestCase):
             commands.append(command)
             query = command[-1]
             if "information_schema.columns" in query:
-                return {"success": True, "output": "name\nvat\nemail\nphone\nis_company\ndeclarant_condition\nl10n_co_edi_large_taxpayer\nl10n_co_edi_fiscal_regimen\nl10n_co_edi_commercial_name\n"}
+                return {"success": True, "output": "name\ncomplete_name\nvat\nemail\nphone\nis_company\ndeclarant_condition\nl10n_co_edi_large_taxpayer\nl10n_co_edi_fiscal_regimen\nl10n_co_edi_commercial_name\n"}
             if "FROM res_company" in query:
                 return {"success": True, "output": "11\t37\n"}
             return {"success": True, "output": ""}
@@ -275,7 +275,7 @@ class ClientCopyDestinationTest(unittest.TestCase):
                     "vat": {"type": "char", "value": "900000000"},
                     "email": {"type": "char", "value": "cliente@example.com"},
                     "phone": {"type": "char", "value": "+57 3000000000"},
-                    "is_company": {"type": "boolean", "value": True},
+                    "is_company": {"type": "boolean", "value": False},
                     "declarant_condition": {"type": "selection", "value": "non_declarant"},
                     "l10n_co_edi_large_taxpayer": {"type": "boolean", "value": False},
                     "l10n_co_edi_fiscal_regimen": {"type": "selection", "value": "48"},
@@ -302,6 +302,9 @@ class ClientCopyDestinationTest(unittest.TestCase):
         )
         self.assertNotIn("ir_model_data", company_query)
         self.assertIn("WHERE id = 37", update_query)
+        self.assertIn("\"is_company\" = FALSE", update_query)
+        self.assertIn("\"l10n_co_edi_large_taxpayer\" = FALSE", update_query)
+        self.assertIn("\"complete_name\" = 'Cliente solicitado'", update_query)
         self.assertIn("SET name = 'Cliente solicitado'", company_update_query)
         self.assertIn("WHERE id = 11", company_update_query)
         self.assertEqual(
