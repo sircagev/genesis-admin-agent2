@@ -861,6 +861,20 @@ class OdooModuleManager:
                 applied_versions.get(name),
             )
             target = str(values.get("version") or "").strip()
+            if not effective:
+                automatic.append(
+                    {
+                        "sequence": len(automatic) * 10 + 10,
+                        "action": "upgrade",
+                        "module": name,
+                        "phase": "after_code",
+                        "reason": (
+                            "La version instalada no fue informada; "
+                            "se actualiza para sincronizarla"
+                        ),
+                    }
+                )
+                continue
             try:
                 comparison = self._version_compare(
                     target,
@@ -993,21 +1007,23 @@ class OdooModuleManager:
                 applied_versions.get(name),
             )
             current_key = ()
+            source_version_known = bool(effective)
             if action == "upgrade":
-                try:
-                    current_key = self._version_key(effective)
-                except CommandError as exc:
-                    blockers.append(f"{name}: {exc}")
-                    return
-                if self._version_compare(
-                    target_version,
-                    effective,
-                ) < 0:
-                    blockers.append(
-                        f"{name}: no se permite bajar de "
-                        f"{effective} a {target_version}."
-                    )
-                    return
+                if source_version_known:
+                    try:
+                        current_key = self._version_key(effective)
+                    except CommandError as exc:
+                        blockers.append(f"{name}: {exc}")
+                        return
+                    if self._version_compare(
+                        target_version,
+                        effective,
+                    ) < 0:
+                        blockers.append(
+                            f"{name}: no se permite bajar de "
+                            f"{effective} a {target_version}."
+                        )
+                        return
 
             required = str(
                 step.get("required_version") or ""
@@ -1041,7 +1057,10 @@ class OdooModuleManager:
                 if action == "install":
                     if rule["apply_on_install"]:
                         applicable.append(rule)
-                elif rule["target_key"] > current_key:
+                elif (
+                    source_version_known
+                    and rule["target_key"] > current_key
+                ):
                     applicable.append(rule)
 
             for rule in applicable:
@@ -1461,14 +1480,20 @@ class OdooModuleManager:
                 raise CommandError(
                     f"El modulo {name} no esta instalado."
                 )
-            if required and self._version_compare(
-                installed_version,
-                required,
-            ) < 0:
-                raise CommandError(
-                    f"El modulo {name} tiene {installed_version} "
-                    f"y requiere al menos {required}."
-                )
+            if required:
+                if not installed_version:
+                    raise CommandError(
+                        f"El modulo {name} no informa su version; "
+                        "no es posible verificar el requisito."
+                    )
+                if self._version_compare(
+                    installed_version,
+                    required,
+                ) < 0:
+                    raise CommandError(
+                        f"El modulo {name} tiene {installed_version} "
+                        f"y requiere al menos {required}."
+                    )
             return {
                 "module": name,
                 "action": action,
@@ -1478,14 +1503,19 @@ class OdooModuleManager:
 
         execution_action = action
         if action == "install" and installed:
-            if (
-                required
-                and self._version_compare(
+            if required:
+                if not installed_version or self._version_compare(
                     installed_version,
                     required,
-                ) < 0
-            ):
-                execution_action = "upgrade"
+                ) < 0:
+                    execution_action = "upgrade"
+                else:
+                    return {
+                        "module": name,
+                        "action": action,
+                        "status": "skipped",
+                        "installed_version": installed_version,
+                    }
             else:
                 return {
                     "module": name,
@@ -1582,24 +1612,28 @@ class OdooModuleManager:
         verified_version = str(
             verified.get("installed_version") or ""
         ).strip()
-        if (
-            required
-            and self._version_compare(
-                verified_version,
-                required,
-            ) < 0
-        ):
-            raise CommandError(
-                f"{name} termino en {verified_version}, "
-                f"pero se requiere al menos {required}."
-            )
-        return {
+        result = {
             "module": name,
             "action": action,
             "executed_action": execution_action,
             "status": "success",
             "installed_version": verified_version,
         }
+        if required:
+            if not verified_version:
+                result["version_warning"] = (
+                    "Odoo no informo la version despues de la operacion; "
+                    "se registrara la version administrada del plan."
+                )
+            elif self._version_compare(
+                verified_version,
+                required,
+            ) < 0:
+                raise CommandError(
+                    f"{name} termino en {verified_version}, "
+                    f"pero se requiere al menos {required}."
+                )
+        return result
 
     def _restart_service_boundary(self, context):
         unit = context["service"]["unit"]

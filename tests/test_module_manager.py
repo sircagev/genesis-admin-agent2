@@ -734,6 +734,91 @@ class OdooModuleManagerTest(unittest.TestCase):
             [("upgrade", "old_module")],
         )
 
+    def test_update_installed_selects_module_without_reported_version(self):
+        catalog = {
+            "module_a": {
+                "version": "19.0.2.0.0",
+                "installable": True,
+                "dependencies": [],
+            }
+        }
+        installed = {
+            "module_a": {
+                "state": "installed",
+                "installed_version": "",
+            }
+        }
+
+        expanded, blockers, _proposed, requested = (
+            self.manager._expand_versioned_steps(
+                [],
+                "update_installed",
+                catalog,
+                installed,
+                [],
+                {},
+            )
+        )
+
+        self.assertFalse(blockers)
+        self.assertEqual([step["module"] for step in requested], ["module_a"])
+        self.assertEqual(
+            [(step["action"], step["module"]) for step in expanded],
+            [("upgrade", "module_a")],
+        )
+        self.assertEqual(
+            expanded[0]["required_version"],
+            "19.0.2.0.0",
+        )
+
+    def test_upgrade_succeeds_when_odoo_does_not_report_version_afterwards(self):
+        context = {
+            "database": "customer",
+            "runtime": {
+                "version": "19",
+                "python": Path("/opt/customer/venv/bin/python"),
+                "odoo_bin": Path("/opt/customer/odoo-bin"),
+                "config": Path("/etc/odoocustomer.conf"),
+            },
+        }
+        with patch.object(
+            self.manager,
+            "_module_state",
+            side_effect=[
+                {"state": "installed", "installed_version": ""},
+                {"state": "installed", "installed_version": ""},
+            ],
+        ):
+            result = self.manager._execute_step(
+                context,
+                {
+                    "action": "upgrade",
+                    "module": "module_a",
+                    "required_version": "19.0.2.0.0",
+                },
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["installed_version"], "")
+        self.assertIn("no informo la version", result["version_warning"])
+
+    def test_verify_without_reported_version_has_clear_error(self):
+        with (
+            patch.object(
+                self.manager,
+                "_module_state",
+                return_value={"state": "installed", "installed_version": ""},
+            ),
+            self.assertRaisesRegex(CommandError, "no informa su version"),
+        ):
+            self.manager._execute_step(
+                {"database": "customer", "runtime": {"version": "19"}},
+                {
+                    "action": "verify",
+                    "module": "module_a",
+                    "required_version": "19.0.2.0.0",
+                },
+            )
 
 if __name__ == "__main__":
     unittest.main()
