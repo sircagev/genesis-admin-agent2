@@ -891,6 +891,54 @@ class OdooModuleManagerTest(unittest.TestCase):
 
         self.assertIn("existe en Git", result["blockers"][0])
 
+    def test_preflight_reuses_installed_transitive_dependency(self):
+        context = {
+            "service": {"addons_path": "/opt/customer/repo/modulos"},
+            "repo": {"path": Path("/opt/customer/repo")},
+        }
+        catalog = {
+            "custom_invoice_product_fields": {
+                "subpath": "modulos",
+                "dependencies": ["l10n_co_dian"],
+            },
+            "l10n_co_dian": {
+                "subpath": "modulos",
+                "dependencies": ["certificate"],
+            },
+            "certificate": {"subpath": "modulos", "dependencies": []},
+        }
+        runtime = {
+            "modules": [
+                {
+                    "name": "certificate",
+                    "recognized": True,
+                    "path": "/opt/customer/shared_addons/certificate",
+                    "database_state": "installed",
+                    "dependencies": [],
+                    "can_install": True,
+                }
+            ],
+            "pending_modules": [],
+            "graph_omitted": [],
+            "graph_error": "",
+        }
+        with patch.object(self.manager, "_run_tool", return_value=runtime):
+            result = self.manager._dependency_preflight(
+                context,
+                catalog,
+                [
+                    {
+                        "action": "upgrade",
+                        "module": "custom_invoice_product_fields",
+                    }
+                ],
+            )
+
+        self.assertFalse(result["blockers"])
+        self.assertTrue(
+            any("certificate: Odoo resuelve" in warning for warning in result["warnings"])
+        )
+
     def test_install_requires_installed_state_after_command(self):
         context = {
             "database": "customer",

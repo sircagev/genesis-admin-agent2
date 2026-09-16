@@ -612,6 +612,7 @@ class OdooModuleManager:
                 "missing_dependencies": [],
                 "install_order": [],
                 "states_before": [],
+                "warnings": [],
                 "blockers": [],
             }
         runtime = self._run_tool(context, "preflight", roots)
@@ -628,6 +629,7 @@ class OdooModuleManager:
             if value.strip()
         }
         blockers, missing, found, order, states = [], [], [], [], []
+        warnings = []
         visiting, visited = [], set()
         for item in runtime.get("pending_modules") or []:
             blockers.append(
@@ -648,6 +650,8 @@ class OdooModuleManager:
             target = catalog.get(name)
             node = runtime_nodes.get(name) or {}
             expected_path = None
+            state = str(node.get("database_state") or "not_registered")
+            reused_dependency = name not in roots and state == "installed"
             if target:
                 expected_path = (
                     Path(context["repo"]["path"])
@@ -655,19 +659,29 @@ class OdooModuleManager:
                     / name
                 ).resolve()
                 if str(expected_path.parent) not in addons_paths:
-                    fail(
-                        [*chain, name],
-                        "existe en Git pero su directorio no esta en addons_path",
+                    if not reused_dependency:
+                        fail(
+                            [*chain, name],
+                            "existe en Git pero su directorio no esta en addons_path",
+                        )
+                        return
+                    warnings.append(
+                        f"{name}: se reutiliza la dependencia instalada "
+                        "desde su addons_path efectivo."
                     )
-                    return
                 if node.get("recognized") and str(
                     Path(node.get("path") or "").resolve()
                 ) != str(expected_path):
-                    fail(
-                        [*chain, name],
-                        "Odoo resuelve otro modulo con el mismo nombre",
+                    if not reused_dependency:
+                        fail(
+                            [*chain, name],
+                            "Odoo resuelve otro modulo con el mismo nombre",
+                        )
+                        return
+                    warnings.append(
+                        f"{name}: Odoo resuelve una dependencia instalada "
+                        "desde otra ruta."
                     )
-                    return
                 dependencies = target.get("dependencies") or []
             else:
                 if not node.get("recognized"):
@@ -677,7 +691,6 @@ class OdooModuleManager:
                     )
                     return
                 dependencies = node.get("dependencies") or []
-            state = str(node.get("database_state") or "not_registered")
             states.append({"name": name, "state": state})
             if state in {"to install", "to upgrade", "to remove"}:
                 fail([*chain, name], f"estado inconsistente: {state}")
@@ -727,6 +740,7 @@ class OdooModuleManager:
             "missing_dependencies": missing,
             "install_order": order,
             "states_before": states,
+            "warnings": list(dict.fromkeys(warnings)),
             "addons_path": sorted(addons_paths),
             "blockers": list(dict.fromkeys(blockers)),
         }
