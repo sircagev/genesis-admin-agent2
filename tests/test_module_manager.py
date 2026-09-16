@@ -243,7 +243,10 @@ class OdooModuleManagerTest(unittest.TestCase):
         with patch.object(
             self.manager,
             "_module_state",
-            return_value={"state": "uninstalled"},
+            side_effect=[
+                {"state": "uninstalled"},
+                {"state": "installed", "installed_version": "19.0.1.0.0"},
+            ],
         ):
             result = self.manager._execute_step(
                 context,
@@ -818,6 +821,100 @@ class OdooModuleManagerTest(unittest.TestCase):
                     "module": "module_a",
                     "required_version": "19.0.2.0.0",
                 },
+            )
+
+    def test_dependency_preflight_reports_complete_missing_chain(self):
+        context = {
+            "service": {"addons_path": "/opt/customer/repo/modulos"},
+            "repo": {"path": Path("/opt/customer/repo")},
+        }
+        catalog = {
+            "pw_pos_sale_order": {
+                "subpath": "modulos",
+                "dependencies": ["l10n_co_pos_dian_ticket"],
+            },
+            "l10n_co_pos_dian_ticket": {
+                "subpath": "modulos",
+                "dependencies": ["access_pos_retention_rule"],
+            },
+            "access_pos_retention_rule": {
+                "subpath": "modulos",
+                "dependencies": ["partner_declarant_condition"],
+            },
+        }
+        runtime = {
+            "modules": [],
+            "pending_modules": [],
+            "graph_omitted": [],
+            "graph_error": "",
+        }
+        with patch.object(self.manager, "_run_tool", return_value=runtime):
+            result = self.manager._dependency_preflight(
+                context,
+                catalog,
+                [{"action": "install", "module": "pw_pos_sale_order"}],
+            )
+
+        self.assertIn(
+            {
+                "chain": [
+                    "pw_pos_sale_order",
+                    "l10n_co_pos_dian_ticket",
+                    "access_pos_retention_rule",
+                    "partner_declarant_condition",
+                ],
+                "reason": "faltante en addons_path o no reconocido por Odoo",
+            },
+            result["missing_dependencies"],
+        )
+
+    def test_dependency_preflight_rejects_git_module_outside_addons_path(self):
+        context = {
+            "service": {"addons_path": "/opt/customer/other_addons"},
+            "repo": {"path": Path("/opt/customer/repo")},
+        }
+        catalog = {
+            "module_a": {"subpath": "modulos", "dependencies": []}
+        }
+        runtime = {
+            "modules": [],
+            "pending_modules": [],
+            "graph_omitted": [],
+            "graph_error": "",
+        }
+        with patch.object(self.manager, "_run_tool", return_value=runtime):
+            result = self.manager._dependency_preflight(
+                context,
+                catalog,
+                [{"action": "install", "module": "module_a"}],
+            )
+
+        self.assertIn("existe en Git", result["blockers"][0])
+
+    def test_install_requires_installed_state_after_command(self):
+        context = {
+            "database": "customer",
+            "runtime": {
+                "version": "19",
+                "python": Path("/opt/customer/venv/bin/python"),
+                "odoo_bin": Path("/opt/customer/odoo-bin"),
+                "config": Path("/etc/odoocustomer.conf"),
+            },
+        }
+        with (
+            patch.object(
+                self.manager,
+                "_module_state",
+                side_effect=[
+                    {"state": "uninstalled"},
+                    {"state": "uninstalled"},
+                ],
+            ),
+            self.assertRaisesRegex(CommandError, "no en installed"),
+        ):
+            self.manager._execute_step(
+                context,
+                {"action": "install", "module": "module_a"},
             )
 
 if __name__ == "__main__":

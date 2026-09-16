@@ -473,6 +473,21 @@ class OdooModuleManager:
                         dict,
                     )
                     else {},
+                    "required_models": sorted(
+                        {
+                            str(item).strip()
+                            for item in (
+                                manifest.get("genesis_required_models")
+                                or []
+                            )
+                            if str(item).strip()
+                        }
+                    )
+                    if isinstance(
+                        manifest.get("genesis_required_models"),
+                        (list, tuple),
+                    )
+                    else [],
                     "subpath": subpath,
                 }
         return modules
@@ -580,6 +595,141 @@ class OdooModuleManager:
                         pending.append(dependency)
         result.discard(module)
         return sorted(result)
+
+    def _dependency_preflight(self, context, catalog, steps):
+        roots = sorted(
+            {
+                step["module"]
+                for step in steps
+                if step.get("action") in ("install", "upgrade")
+                and step.get("module")
+            }
+        )
+        if not roots:
+            return {
+                "requested_modules": [],
+                "dependencies_found": [],
+                "missing_dependencies": [],
+                "install_order": [],
+                "states_before": [],
+                "blockers": [],
+            }
+        runtime = self._run_tool(context, "preflight", roots)
+        runtime_nodes = {
+            item.get("name"): item
+            for item in runtime.get("modules") or []
+            if isinstance(item, dict) and item.get("name")
+        }
+        addons_paths = {
+            str(Path(value.strip()).resolve())
+            for value in str(
+                context["service"].get("addons_path") or ""
+            ).split(",")
+            if value.strip()
+        }
+        blockers, missing, found, order, states = [], [], [], [], []
+        visiting, visited = [], set()
+        for item in runtime.get("pending_modules") or []:
+            blockers.append(
+                "Hay una operacion de modulo pendiente: "
+                f"{item.get('name')} ({item.get('state')})."
+            )
+
+        def fail(chain, reason):
+            missing.append({"chain": chain, "reason": reason})
+            blockers.append(" -> ".join(chain) + f" ({reason})")
+
+        def visit(name, chain):
+            if name in visiting:
+                fail([*chain, name], "ciclo de dependencias")
+                return
+            if name in visited:
+                return
+            target = catalog.get(name)
+            node = runtime_nodes.get(name) or {}
+            expected_path = None
+            if target:
+                expected_path = (
+                    Path(context["repo"]["path"])
+                    / str(target.get("subpath") or "")
+                    / name
+                ).resolve()
+                if str(expected_path.parent) not in addons_paths:
+                    fail(
+                        [*chain, name],
+                        "existe en Git pero su directorio no esta en addons_path",
+                    )
+                    return
+                if node.get("recognized") and str(
+                    Path(node.get("path") or "").resolve()
+                ) != str(expected_path):
+                    fail(
+                        [*chain, name],
+                        "Odoo resuelve otro modulo con el mismo nombre",
+                    )
+                    return
+                dependencies = target.get("dependencies") or []
+            else:
+                if not node.get("recognized"):
+                    fail(
+                        [*chain, name],
+                        "faltante en addons_path o no reconocido por Odoo",
+                    )
+                    return
+                dependencies = node.get("dependencies") or []
+            state = str(node.get("database_state") or "not_registered")
+            states.append({"name": name, "state": state})
+            if state in {"to install", "to upgrade", "to remove"}:
+                fail([*chain, name], f"estado inconsistente: {state}")
+                return
+            if state == "uninstallable":
+                fail([*chain, name], "modulo no instalable")
+                return
+            if node.get("recognized") and not node.get("can_install"):
+                fail(
+                    [*chain, name],
+                    node.get("error") or "Odoo no puede instalar el modulo",
+                )
+                return
+            visiting.append(name)
+            for dependency in sorted(set(dependencies)):
+                visit(str(dependency), [*chain, name])
+            visiting.pop()
+            visited.add(name)
+            found.append(
+                {
+                    "name": name,
+                    "path": str(expected_path or node.get("path") or ""),
+                    "state": state,
+                    "dependencies": sorted(set(dependencies)),
+                    "required_models": (
+                        target.get("required_models") or []
+                        if target
+                        else []
+                    ),
+                }
+            )
+            order.append(name)
+
+        for root in roots:
+            visit(root, [])
+        for name in runtime.get("graph_omitted") or []:
+            if name in visited:
+                fail([name], "omitido por module_graph")
+        if runtime.get("graph_error"):
+            blockers.append(
+                "No fue posible validar module_graph: "
+                + str(runtime["graph_error"])
+            )
+        return {
+            "requested_modules": roots,
+            "dependencies_found": found,
+            "missing_dependencies": missing,
+            "install_order": order,
+            "states_before": states,
+            "addons_path": sorted(addons_paths),
+            "blockers": list(dict.fromkeys(blockers)),
+        }
 
     @staticmethod
     def _fingerprint(data):
@@ -1344,6 +1494,12 @@ class OdooModuleManager:
                 applied_versions,
             )
         )
+        dependency_preflight = self._dependency_preflight(
+            context,
+            catalog,
+            expanded,
+        )
+        blockers.extend(dependency_preflight["blockers"])
         planned, validation_blockers = self._enrich_planned_steps(
             context,
             expanded,
@@ -1375,6 +1531,7 @@ class OdooModuleManager:
             "selection_mode": selection_mode,
             "steps": planned,
             "applied_versions": proposed_versions,
+            "dependency_preflight": dependency_preflight,
         }
         fingerprint = self._fingerprint(snapshot)
         self._progress("finished", 100, "Simulacion de modulos terminada.")
@@ -1403,6 +1560,7 @@ class OdooModuleManager:
             "catalog_count": len(catalog),
             "modules": catalog_modules,
             "applied_versions": proposed_versions,
+            "dependency_preflight": dependency_preflight,
         }
 
     def _backup_database(self, database, target_sha):
@@ -1612,12 +1770,19 @@ class OdooModuleManager:
         verified_version = str(
             verified.get("installed_version") or ""
         ).strip()
+        verified_state = str(verified.get("state") or "uninstalled")
+        if verified_state != "installed":
+            raise CommandError(
+                f"{name} termino en estado {verified_state}, "
+                "no en installed."
+            )
         result = {
             "module": name,
             "action": action,
             "executed_action": execution_action,
             "status": "success",
             "installed_version": verified_version,
+            "state_after": verified_state,
         }
         if required:
             if not verified_version:
@@ -1736,6 +1901,9 @@ class OdooModuleManager:
         was_running = status.get("active_state") == "active"
         results = []
         failure = None
+        final_inventory = None
+        postflight = {}
+        current_step = {}
         try:
             if was_running:
                 self._progress("stop", 32, "Deteniendo servicio Odoo.")
@@ -1750,6 +1918,7 @@ class OdooModuleManager:
             before = [step for step in steps if step["phase"] == "before_code"]
             after = [step for step in steps if step["phase"] == "after_code"]
             for index, step in enumerate(before, start=1):
+                current_step = step
                 self._progress(
                     "before_code",
                     35 + min(index * 4, 12),
@@ -1759,8 +1928,24 @@ class OdooModuleManager:
 
             self._progress("code", 52, "Aplicando commit de modulos aprobado.")
             self._merge_code(context, target_sha)
+            runtime_catalog = self._scan_catalog(
+                context["repo"]["path"],
+                context["repository"]["subpaths"],
+                context["runtime"]["version"],
+            )
+            runtime_preflight = self._dependency_preflight(
+                context,
+                runtime_catalog,
+                steps,
+            )
+            if runtime_preflight["blockers"]:
+                raise CommandError(
+                    "Preflight posterior al merge bloqueado: "
+                    + "; ".join(runtime_preflight["blockers"])
+                )
 
             for index, step in enumerate(after, start=1):
+                current_step = step
                 self._progress(
                     "modules",
                     58 + min(index * 6, 28),
@@ -1776,6 +1961,51 @@ class OdooModuleManager:
                     )
 
             self._progress("verify", 90, "Verificando estados de modulos.")
+            postflight = self._run_tool(
+                context,
+                "preflight",
+                planned["dependency_preflight"]["requested_modules"],
+            )
+            postflight_nodes = {
+                item.get("name"): item
+                for item in postflight.get("modules") or []
+                if isinstance(item, dict) and item.get("name")
+            }
+            expected_modules = planned["dependency_preflight"]["install_order"]
+            invalid_after = [
+                name
+                for name in expected_modules
+                if postflight_nodes.get(name, {}).get("database_state")
+                != "installed"
+            ]
+            missing_models = [
+                f"{item['name']}.{model_name}"
+                for item in planned["dependency_preflight"][
+                    "dependencies_found"
+                ]
+                for model_name in item.get("required_models") or []
+                if model_name
+                not in set(
+                    postflight_nodes.get(item["name"], {}).get(
+                        "registered_models"
+                    ) or []
+                )
+            ]
+            if (
+                invalid_after
+                or missing_models
+                or postflight.get("pending_modules")
+                or postflight.get("graph_omitted")
+            ):
+                raise CommandError(
+                    "Verificacion posterior incompleta: "
+                    + ", ".join(
+                        invalid_after
+                        or missing_models
+                        or postflight.get("graph_omitted")
+                        or []
+                    )
+                )
             final_inventory = self.inventory(
                 {
                     **payload,
@@ -1784,7 +2014,20 @@ class OdooModuleManager:
             )
         except Exception as exc:  # pylint: disable=broad-except
             failure = exc
-            final_inventory = None
+            try:
+                postflight = self._run_tool(
+                    context,
+                    "preflight",
+                    planned["dependency_preflight"]["requested_modules"],
+                )
+                final_inventory = self.inventory(
+                    {
+                        **payload,
+                        "steps": [],
+                    }
+                )
+            except Exception:  # Preserve the original deployment failure.
+                pass
         finally:
             if was_running:
                 self._progress("start", 95, "Iniciando servicio Odoo.")
@@ -1816,7 +2059,43 @@ class OdooModuleManager:
                 if applied
                 else ""
             )
-            raise CommandError(f"{failure}{recovery}{partial}") from failure
+            return {
+                "success": False,
+                "message": f"{failure}{recovery}{partial}",
+                "error": str(failure),
+                "database_name": context["database"],
+                "service_name": context["service"]["unit"],
+                "target_sha": target_sha,
+                "plan_fingerprint": approved,
+                "backup": backup or {},
+                "recovery_required": bool(backup),
+                "steps": results,
+                "inventory": final_inventory or {},
+                "dependency_preflight": planned.get(
+                    "dependency_preflight"
+                ) or {},
+                "postflight": postflight or {},
+                "requested_modules": planned.get(
+                    "dependency_preflight", {}
+                ).get("requested_modules") or [],
+                "root_module": (
+                    current_step.get("transition_module")
+                    or current_step.get("module")
+                    or ""
+                ),
+                "states_before": planned.get(
+                    "dependency_preflight", {}
+                ).get("states_before") or [],
+                "states_after": [
+                    {
+                        "name": item.get("name"),
+                        "state": item.get("database_state"),
+                    }
+                    for item in postflight.get("modules") or []
+                    if isinstance(item, dict)
+                ],
+                "applied_versions": {},
+            }
 
         health = systemd_status(context["service"]["unit"])
         self._progress("finished", 100, "Despliegue de modulos terminado.")
@@ -1830,6 +2109,24 @@ class OdooModuleManager:
             "backup": backup or {},
             "steps": results,
             "inventory": final_inventory or {},
+            "dependency_preflight": planned.get(
+                "dependency_preflight"
+            ) or {},
+            "postflight": postflight or {},
+            "requested_modules": planned.get(
+                "dependency_preflight", {}
+            ).get("requested_modules") or [],
+            "states_before": planned.get(
+                "dependency_preflight", {}
+            ).get("states_before") or [],
+            "states_after": [
+                {
+                    "name": item.get("name"),
+                    "state": item.get("database_state"),
+                }
+                for item in postflight.get("modules") or []
+                if isinstance(item, dict)
+            ],
             "applied_versions": (
                 planned.get("applied_versions") or {}
             ),

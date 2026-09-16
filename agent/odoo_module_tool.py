@@ -101,6 +101,112 @@ def _inventory(env):
     }
 
 
+def _preflight(env, names):
+    """Inspect module availability without scheduling a module operation."""
+    from odoo.modules.module import (
+        Manifest,
+        get_module_path,
+        initialize_sys_path,
+    )
+    from odoo.modules.module_graph import ModuleGraph
+    from odoo.tools import config
+
+    initialize_sys_path()
+    Module = env["ir.module.module"]
+    records = {
+        module.name: module
+        for module in Module.search([], order="name")
+    }
+    pending_states = {"to install", "to upgrade", "to remove"}
+    pending_modules = [
+        _module_values(module)
+        for module in records.values()
+        if module.state in pending_states
+    ]
+    nodes = {}
+    missing = []
+    queue = [(name, []) for name in sorted(set(names))]
+    while queue:
+        name, chain = queue.pop(0)
+        if name in nodes:
+            continue
+        path = get_module_path(name, display_warning=False)
+        manifest = Manifest.for_addon(name, display_warning=False)
+        record = records.get(name)
+        if not path or manifest is None:
+            nodes[name] = {
+                "name": name,
+                "path": "",
+                "recognized": False,
+                "installable": False,
+                "database_state": record.state if record else "not_registered",
+                "dependencies": [],
+                "can_install": False,
+                "error": "Modulo no encontrado en addons_path.",
+            }
+            missing.append({"module": name, "chain": [*chain, name]})
+            continue
+        dependencies = sorted(
+            {
+                str(item)
+                for item in (manifest.get("depends") or [])
+                if str(item)
+            }
+        )
+        external_error = ""
+        try:
+            Module.check_external_dependencies(name, "to install")
+        except Exception as exc:  # Odoo returns a user-facing diagnostic.
+            external_error = str(exc)
+        installable = bool(manifest.get("installable", True))
+        state = record.state if record else "not_registered"
+        registered_models = sorted(
+            model_name
+            for model_name in env.registry
+            if getattr(env.registry[model_name], "_module", "") == name
+        )
+        nodes[name] = {
+            "name": name,
+            "path": str(path),
+            "recognized": True,
+            "installable": installable,
+            "database_state": state,
+            "dependencies": dependencies,
+            "registered_models": registered_models,
+            "can_install": bool(
+                installable
+                and state != "uninstallable"
+                and not external_error
+            ),
+            "error": external_error,
+        }
+        for dependency in dependencies:
+            queue.append((dependency, [*chain, name]))
+
+    graph_omitted = []
+    graph_error = ""
+    graph_candidates = [
+        name for name, node in nodes.items() if node["recognized"]
+    ]
+    if graph_candidates:
+        try:
+            graph = ModuleGraph(env.cr, mode="update")
+            graph.extend(graph_candidates)
+            graph_names = {node.name for node in graph}
+            graph_omitted = sorted(set(graph_candidates) - graph_names)
+        except Exception as exc:  # Keep preflight diagnostic, never hide it.
+            graph_error = str(exc)
+
+    return {
+        "modules": [nodes[name] for name in sorted(nodes)],
+        "missing_dependencies": missing,
+        "pending_modules": pending_modules,
+        "graph_omitted": graph_omitted,
+        "graph_error": graph_error,
+        "addons_path": [str(path) for path in config["addons_path"]],
+    }
+
+
 def _impact(env, names):
     Module = env["ir.module.module"]
     selected = Module.search([("name", "in", names)])
@@ -164,6 +270,8 @@ def main():
         env = Environment(cursor, superuser_id, {})
         if mode == "inventory":
             result = _inventory(env)
+        elif mode == "preflight":
+            result = _preflight(env, names)
         elif mode == "impact":
             result = _impact(env, names)
         elif mode == "uninstall":
