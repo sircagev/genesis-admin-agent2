@@ -746,6 +746,51 @@ class OdooModuleManager:
         }
 
     @staticmethod
+    def _inject_dependency_installs(steps, dependency_preflight):
+        """Schedule available, uninstalled dependencies before roots.
+
+        An Odoo ``upgrade`` does not reliably schedule a dependency that is
+        merely present on disk but absent from ``ir_module_module``. The
+        preflight traversal is post-order, so its install order is safe for
+        explicit dependency installations.
+        """
+        existing_installs = {
+            step.get("module")
+            for step in steps
+            if step.get("action") == "install" and step.get("module")
+        }
+        generated = []
+        for item in dependency_preflight.get("dependencies_found") or []:
+            name = str(item.get("name") or "").strip()
+            state = str(item.get("state") or "").strip()
+            if (
+                not name
+                or name in existing_installs
+                or state not in {"uninstalled", "not_registered"}
+            ):
+                continue
+            generated.append(
+                {
+                    "sequence": 0,
+                    "action": "install",
+                    "module": name,
+                    "required_version": "",
+                    "phase": "after_code",
+                    "notes": (
+                        "Dependencia transitiva disponible pero no instalada."
+                    ),
+                    "reason": "Instalacion automatica de dependencia",
+                    "automatic_dependency": True,
+                }
+            )
+            existing_installs.add(name)
+
+        combined = [*generated, *steps]
+        for position, step in enumerate(combined, start=1):
+            step["sequence"] = position * 10
+        return combined
+
+    @staticmethod
     def _fingerprint(data):
         encoded = json.dumps(
             data,
@@ -1514,6 +1559,10 @@ class OdooModuleManager:
             expanded,
         )
         blockers.extend(dependency_preflight["blockers"])
+        expanded = self._inject_dependency_installs(
+            expanded,
+            dependency_preflight,
+        )
         planned, validation_blockers = self._enrich_planned_steps(
             context,
             expanded,

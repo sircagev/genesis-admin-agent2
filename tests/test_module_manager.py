@@ -939,6 +939,74 @@ class OdooModuleManagerTest(unittest.TestCase):
             any("certificate: Odoo resuelve" in warning for warning in result["warnings"])
         )
 
+    def test_preflight_inserts_uninstalled_dependencies_before_upgrade(self):
+        steps = [
+            {
+                "sequence": 10,
+                "action": "upgrade",
+                "module": "access_pos_retention_rule",
+                "phase": "after_code",
+            }
+        ]
+        preflight = {
+            "dependencies_found": [
+                {
+                    "name": "partner_declarant_condition",
+                    "state": "uninstalled",
+                },
+                {
+                    "name": "access_pos_retention_rule",
+                    "state": "installed",
+                },
+            ]
+        }
+
+        result = self.manager._inject_dependency_installs(
+            steps,
+            preflight,
+        )
+
+        self.assertEqual(
+            [(step["action"], step["module"]) for step in result],
+            [
+                ("install", "partner_declarant_condition"),
+                ("upgrade", "access_pos_retention_rule"),
+            ],
+        )
+        self.assertTrue(result[0]["automatic_dependency"])
+
+    def test_preflight_does_not_duplicate_explicit_install(self):
+        steps = [
+            {
+                "sequence": 10,
+                "action": "install",
+                "module": "partner_declarant_condition",
+                "phase": "after_code",
+            },
+            {
+                "sequence": 20,
+                "action": "upgrade",
+                "module": "access_pos_retention_rule",
+                "phase": "after_code",
+            },
+        ]
+        result = self.manager._inject_dependency_installs(
+            steps,
+            {
+                "dependencies_found": [
+                    {
+                        "name": "partner_declarant_condition",
+                        "state": "uninstalled",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(
+            [step["module"] for step in result],
+            ["partner_declarant_condition", "access_pos_retention_rule"],
+        )
+
     def test_install_requires_installed_state_after_command(self):
         context = {
             "database": "customer",
