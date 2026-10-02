@@ -234,10 +234,15 @@ class JobExecutor:
             payload
         )
 
+        command = {
+            "start": ["enable", "--now"],
+            "stop": ["disable", "--now"],
+        }.get(action, [action])
+
         result = run(
             [
                 "systemctl",
-                action,
+                *command,
                 unit,
             ],
             timeout=120,
