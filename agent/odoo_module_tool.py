@@ -101,6 +101,61 @@ def _inventory(env):
     }
 
 
+def _catalog(env):
+    """Return manifests resolved from Odoo's effective addons_path.
+
+    This is deliberately separate from the database inventory: a module can
+    be available on disk (and be a valid dependency) without being installed
+    in the current database.
+    """
+    from odoo.modules.module import Manifest, initialize_sys_path
+    from odoo.tools import config
+
+    initialize_sys_path()
+    modules = []
+    for manifest in Manifest.all_addon_manifests():
+        dependencies = manifest.get("depends") or []
+        if not isinstance(dependencies, (list, tuple)):
+            dependencies = []
+        external_dependencies = manifest.get("external_dependencies") or {}
+        if not isinstance(external_dependencies, dict):
+            external_dependencies = {}
+        required_models = manifest.get("genesis_required_models") or []
+        if not isinstance(required_models, (list, tuple)):
+            required_models = []
+        modules.append(
+            {
+                "name": manifest.name,
+                "path": str(manifest.path),
+                "version": str(manifest.get("version") or ""),
+                "summary": str(
+                    manifest.get("summary")
+                    or manifest.get("name")
+                    or manifest.name
+                ),
+                "installable": bool(manifest.get("installable", True)),
+                "application": bool(manifest.get("application", False)),
+                "auto_install": bool(manifest.get("auto_install", False)),
+                "dependencies": sorted(
+                    {str(item) for item in dependencies if str(item)}
+                ),
+                "external_dependencies": external_dependencies,
+                "required_models": sorted(
+                    {
+                        str(item).strip()
+                        for item in required_models
+                        if str(item).strip()
+                    }
+                ),
+            }
+        )
+    return {
+        "modules": modules,
+        "count": len(modules),
+        "addons_path": [str(path) for path in config["addons_path"]],
+    }
+
+
 def _preflight(env, names):
     """Inspect module availability without scheduling a module operation."""
     from odoo.modules.module import (
@@ -270,6 +325,8 @@ def main():
         env = Environment(cursor, superuser_id, {})
         if mode == "inventory":
             result = _inventory(env)
+        elif mode == "catalog":
+            result = _catalog(env)
         elif mode == "preflight":
             result = _preflight(env, names)
         elif mode == "impact":

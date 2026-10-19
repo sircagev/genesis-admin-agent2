@@ -214,6 +214,128 @@ class OdooModuleManagerTest(unittest.TestCase):
         self.assertEqual(expanded, [])
         self.assertEqual(proposed, {})
 
+    def test_runtime_catalog_keeps_core_modules_unmanaged(self):
+        context = {"runtime": {"version": "19"}}
+        with patch.object(
+            self.manager,
+            "_run_tool",
+            return_value={
+                "modules": [
+                    {
+                        "name": "pos_discount",
+                        "path": "/opt/odoo/addons/pos_discount",
+                        "version": "1.0",
+                        "summary": "Discounts",
+                        "installable": True,
+                        "dependencies": ["point_of_sale"],
+                    }
+                ]
+            },
+        ):
+            catalog = self.manager._runtime_catalog(context)
+
+        self.assertIn("pos_discount", catalog)
+        self.assertFalse(catalog["pos_discount"]["managed"])
+        self.assertEqual(catalog["pos_discount"]["version"], "19.0.1.0")
+
+    def test_automatic_updates_skip_runtime_modules(self):
+        catalog = {
+            "custom_module": {
+                "managed": True,
+                "version": "19.0.2.0.0",
+                "installable": True,
+                "dependencies": [],
+            },
+            "pos_discount": {
+                "managed": False,
+                "version": "19.0.2.0.0",
+                "installable": True,
+                "dependencies": [],
+            },
+        }
+        installed = {
+            "custom_module": {
+                "state": "installed",
+                "installed_version": "19.0.1.0.0",
+            },
+            "pos_discount": {
+                "state": "installed",
+                "installed_version": "19.0.1.0.0",
+            },
+        }
+
+        _expanded, blockers, _proposed, requested = (
+            self.manager._expand_versioned_steps(
+                [],
+                "update_installed",
+                catalog,
+                installed,
+                [],
+                {},
+            )
+        )
+
+        self.assertFalse(blockers)
+        self.assertEqual([step["module"] for step in requested], ["custom_module"])
+
+    def test_preflight_accepts_runtime_module_without_git_path(self):
+        context = {
+            "service": {
+                "addons_path": "/opt/odoo/addons,/opt/customer/repo/modulos"
+            },
+            "repo": {"path": Path("/opt/customer/repo")},
+        }
+        catalog = {
+            "pos_discount": {
+                "managed": False,
+                "dependencies": ["point_of_sale"],
+            }
+        }
+        runtime = {
+            "modules": [
+                {
+                    "name": "pos_discount",
+                    "recognized": True,
+                    "path": "/opt/odoo/addons/pos_discount",
+                    "database_state": "uninstalled",
+                    "dependencies": ["point_of_sale"],
+                    "can_install": True,
+                },
+                {
+                    "name": "point_of_sale",
+                    "recognized": True,
+                    "path": "/opt/odoo/addons/point_of_sale",
+                    "database_state": "installed",
+                    "dependencies": [],
+                    "can_install": True,
+                },
+            ],
+            "pending_modules": [],
+            "graph_omitted": [],
+            "graph_error": "",
+        }
+        with patch.object(self.manager, "_run_tool", return_value=runtime):
+            result = self.manager._dependency_preflight(
+                context,
+                catalog,
+                [{"action": "install", "module": "pos_discount"}],
+            )
+
+        self.assertFalse(result["blockers"])
+        self.assertEqual(
+            [item["name"] for item in result["dependencies_found"]],
+            ["point_of_sale", "pos_discount"],
+        )
+
+    def test_target_catalog_overrides_runtime_module_with_same_name(self):
+        available = self.manager._available_catalog(
+            {"module_a": {"managed": True, "version": "19.0.2.0.0"}},
+            {"module_a": {"managed": False, "version": "19.0.1.0.0"}},
+        )
+
+        self.assertTrue(available["module_a"]["managed"])
+        self.assertEqual(available["module_a"]["version"], "19.0.2.0.0")
+
     def test_upgrade_of_uninstalled_module_is_skipped_at_execution(self):
         context = {"database": "customer", "runtime": {"version": "19"}}
         with patch.object(

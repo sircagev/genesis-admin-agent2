@@ -489,6 +489,7 @@ class OdooModuleManager:
                     )
                     else [],
                     "subpath": subpath,
+                    "managed": True,
                 }
         return modules
 
@@ -525,6 +526,67 @@ class OdooModuleManager:
                         ["worktree", "remove", "--force", str(checkout)],
                         timeout=120,
                     )
+
+    def _runtime_catalog(self, context):
+        """Build the catalog Odoo resolves from its effective addons_path.
+
+        These modules are available for explicit operations and dependencies,
+        but are not governed by the target SHA of the managed repository.
+        """
+        result = self._run_tool(context, "catalog")
+        modules = {}
+        for item in result.get("modules") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not MODULE_RE.fullmatch(name):
+                continue
+            version, version_error = self._catalog_manifest_version(
+                {"version": item.get("version")},
+                context["runtime"]["version"],
+            )
+            dependencies = item.get("dependencies") or []
+            if not isinstance(dependencies, (list, tuple)):
+                dependencies = []
+            required_models = item.get("required_models") or []
+            if not isinstance(required_models, (list, tuple)):
+                required_models = []
+            external_dependencies = item.get("external_dependencies") or {}
+            if not isinstance(external_dependencies, dict):
+                external_dependencies = {}
+            modules[name] = {
+                "name": name,
+                "summary": str(item.get("summary") or name),
+                "version": version,
+                "version_error": version_error,
+                "installable": bool(item.get("installable", True))
+                and not version_error,
+                "application": bool(item.get("application", False)),
+                "auto_install": bool(item.get("auto_install", False)),
+                "dependencies": sorted(
+                    {
+                        str(dependency)
+                        for dependency in dependencies
+                        if MODULE_RE.fullmatch(str(dependency))
+                    }
+                ),
+                "external_dependencies": external_dependencies,
+                "required_models": sorted(
+                    {
+                        str(model).strip()
+                        for model in required_models
+                        if str(model).strip()
+                    }
+                ),
+                "path": str(item.get("path") or ""),
+                "managed": False,
+            }
+        return modules
+
+    @staticmethod
+    def _available_catalog(managed_catalog, runtime_catalog):
+        """Combine catalogs while keeping the target SHA authoritative."""
+        return {**runtime_catalog, **managed_catalog}
 
     def _run_tool(self, context, mode, modules=None):
         request = {
@@ -652,7 +714,7 @@ class OdooModuleManager:
             expected_path = None
             state = str(node.get("database_state") or "not_registered")
             reused_dependency = name not in roots and state == "installed"
-            if target:
+            if target and target.get("managed", True):
                 expected_path = (
                     Path(context["repo"]["path"])
                     / str(target.get("subpath") or "")
@@ -690,7 +752,11 @@ class OdooModuleManager:
                         "faltante en addons_path o no reconocido por Odoo",
                     )
                     return
-                dependencies = node.get("dependencies") or []
+                dependencies = (
+                    target.get("dependencies") or []
+                    if target
+                    else node.get("dependencies") or []
+                )
             states.append({"name": name, "state": state})
             if state in {"to install", "to upgrade", "to remove"}:
                 fail([*chain, name], f"estado inconsistente: {state}")
@@ -1051,6 +1117,8 @@ class OdooModuleManager:
         )
         automatic = []
         for name, values in sorted(catalog.items()):
+            if not values.get("managed", True):
+                continue
             current = installed.get(name) or {}
             if current.get("state") not in (
                 "installed",
@@ -1535,7 +1603,9 @@ class OdooModuleManager:
             ).get("success")
         )
         self._progress("catalog", 45, "Analizando manifests del commit objetivo.")
-        catalog = self._target_catalog(context, target_sha)
+        managed_catalog = self._target_catalog(context, target_sha)
+        runtime_catalog = self._runtime_catalog(context)
+        catalog = self._available_catalog(managed_catalog, runtime_catalog)
         database = self._run_tool(context, "inventory")
         installed = {
             item["name"]: item
@@ -1586,7 +1656,7 @@ class OdooModuleManager:
             )
         blockers = list(dict.fromkeys(blockers))
 
-        catalog_modules = self._combined_inventory(catalog, installed)
+        catalog_modules = self._combined_inventory(managed_catalog, installed)
         snapshot = {
             "database_name": context["database"],
             "service_name": context["service"]["unit"],
@@ -1620,7 +1690,7 @@ class OdooModuleManager:
             "blockers": blockers,
             "executable": not blockers,
             "plan_fingerprint": fingerprint,
-            "catalog_count": len(catalog),
+            "catalog_count": len(managed_catalog),
             "modules": catalog_modules,
             "applied_versions": proposed_versions,
             "dependency_preflight": dependency_preflight,
@@ -1991,10 +2061,14 @@ class OdooModuleManager:
 
             self._progress("code", 52, "Aplicando commit de modulos aprobado.")
             self._merge_code(context, target_sha)
-            runtime_catalog = self._scan_catalog(
+            runtime_managed_catalog = self._scan_catalog(
                 context["repo"]["path"],
                 context["repository"]["subpaths"],
                 context["runtime"]["version"],
+            )
+            runtime_catalog = self._available_catalog(
+                runtime_managed_catalog,
+                self._runtime_catalog(context),
             )
             runtime_preflight = self._dependency_preflight(
                 context,
