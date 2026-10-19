@@ -677,7 +677,20 @@ class OdooModuleManager:
                 "warnings": [],
                 "blockers": [],
             }
-        runtime = self._run_tool(context, "preflight", roots)
+        # The target commit can introduce a dependency that is not present in
+        # the manifest currently deployed on disk.  Ask Odoo to resolve the
+        # complete target dependency closure explicitly; otherwise its
+        # preflight traversal cannot return a node for that new dependency.
+        runtime_roots = set(roots)
+        for root in roots:
+            runtime_roots.update(
+                self._dependency_closure(root, catalog)
+            )
+        runtime = self._run_tool(
+            context,
+            "preflight",
+            sorted(runtime_roots),
+        )
         runtime_nodes = {
             item.get("name"): item
             for item in runtime.get("modules") or []

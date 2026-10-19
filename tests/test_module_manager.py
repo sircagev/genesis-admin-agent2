@@ -990,6 +990,75 @@ class OdooModuleManagerTest(unittest.TestCase):
             result["missing_dependencies"],
         )
 
+    def test_preflight_requests_target_dependencies_absent_from_runtime_manifest(self):
+        context = {
+            "service": {
+                "addons_path": (
+                    "/opt/odoo/addons,/opt/customer/repo/modulos"
+                )
+            },
+            "repo": {"path": Path("/opt/customer/repo")},
+        }
+        catalog = {
+            "genesis_invoice_whatsapp": {
+                "managed": True,
+                "subpath": "modulos",
+                "dependencies": ["sale"],
+            },
+            "sale": {
+                "managed": False,
+                "dependencies": [],
+            },
+        }
+        runtime = {
+            "modules": [
+                {
+                    "name": "genesis_invoice_whatsapp",
+                    "recognized": True,
+                    "path": (
+                        "/opt/customer/repo/modulos/"
+                        "genesis_invoice_whatsapp"
+                    ),
+                    "database_state": "installed",
+                    "dependencies": [],
+                    "can_install": True,
+                },
+                {
+                    "name": "sale",
+                    "recognized": True,
+                    "path": "/opt/odoo/addons/sale",
+                    "database_state": "installed",
+                    "dependencies": [],
+                    "can_install": True,
+                },
+            ],
+            "pending_modules": [],
+            "graph_omitted": [],
+            "graph_error": "",
+        }
+        with patch.object(
+            self.manager,
+            "_run_tool",
+            return_value=runtime,
+        ) as run_tool:
+            result = self.manager._dependency_preflight(
+                context,
+                catalog,
+                [
+                    {
+                        "action": "upgrade",
+                        "module": "genesis_invoice_whatsapp",
+                    }
+                ],
+            )
+
+        run_tool.assert_called_once_with(
+            context,
+            "preflight",
+            ["genesis_invoice_whatsapp", "sale"],
+        )
+        self.assertFalse(result["blockers"])
+
     def test_dependency_preflight_rejects_git_module_outside_addons_path(self):
         context = {
             "service": {"addons_path": "/opt/customer/other_addons"},
