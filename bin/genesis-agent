@@ -14,6 +14,7 @@ from agent.client import ControllerClient  # noqa: E402
 from agent.config import AgentConfig  # noqa: E402
 from agent.inventory import collect_inventory  # noqa: E402
 from agent.updater import AgentUpdater  # noqa: E402
+from agent.scheduled_backup import ScheduledBackupManager  # noqa: E402
 
 
 SERVICE = "genesis-admin-agent.service"
@@ -232,6 +233,21 @@ def cmd_update(_args):
         print("✓ Agente actualizado y reiniciado.")
 
 
+def cmd_backup(args):
+    require_root()
+    manager = ScheduledBackupManager(load_config())
+    result = manager.run(
+        frequency=args.frequency,
+        dry_run=args.dry_run,
+        force=args.force,
+    )
+    print(result.get("message") or result)
+    for item in result.get("failures") or []:
+        print(f"[ERROR] {item}")
+    if not result.get("success"):
+        raise SystemExit(1)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="genesis-agent",
@@ -269,6 +285,13 @@ def build_parser():
 
     p = sub.add_parser("update", help="Actualizar desde origin/main")
     p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("backup", help="Backup programado de bases Odoo")
+    p.add_argument("frequency", choices=("hourly", "daily", "weekly"))
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="Permitir ejecución aunque scheduled_backup.enabled sea false")
+    p.set_defaults(func=cmd_backup)
 
     return parser
 

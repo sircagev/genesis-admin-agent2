@@ -20,6 +20,21 @@ allowed_exact:
 allowed_prefix:
   - odoo-server-
 
+# Mantener desactivado hasta migrar el cron externo. Una lista vacía de
+# database_names selecciona todas las bases asociadas a servicios activos.
+scheduled_backup:
+  enabled: false
+  backup_dir: "/var/backups/odoo"
+  rclone_remote: "odoo-backups:odoo-backups"
+  database_names: []
+  retention:
+    hourly:
+      days: 1
+    daily:
+      days: 7
+    weekly:
+      days: 28
+
 update:
   repository: "sircagev/genesis-admin-agent2"
   branch: "main"

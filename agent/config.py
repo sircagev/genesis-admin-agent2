@@ -22,6 +22,17 @@ DEFAULTS = {
     "log_default_lines": 200,
     "allowed_exact": ["nginx", "remote_print"],
     "allowed_prefix": ["odoo-server-"],
+    "scheduled_backup": {
+        "enabled": False,
+        "backup_dir": "/var/backups/odoo",
+        "rclone_remote": "odoo-backups:odoo-backups",
+        "database_names": [],
+        "retention": {
+            "hourly": {"days": 1},
+            "daily": {"days": 7},
+            "weekly": {"days": 28},
+        },
+    },
     "update": {
         "repository": "sircagev/genesis-admin-agent2",
         "branch": "main",
@@ -100,6 +111,13 @@ class AgentConfig:
             raise RuntimeError("provision debe ser un objeto YAML.")
         if not isinstance(self.data.get("update"), dict):
             raise RuntimeError("update debe ser un objeto YAML.")
+        backup = self.data.get("scheduled_backup")
+        if not isinstance(backup, dict):
+            raise RuntimeError("scheduled_backup debe ser un objeto YAML.")
+        if not isinstance(backup.get("database_names"), list):
+            raise RuntimeError("scheduled_backup.database_names debe ser una lista.")
+        if not isinstance(backup.get("retention"), dict):
+            raise RuntimeError("scheduled_backup.retention debe ser un objeto YAML.")
 
     def get(self, key, default=None):
         return self.data.get(key, default)

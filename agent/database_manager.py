@@ -231,6 +231,10 @@ class DatabaseManager:
             "config": config,
         }
 
+    def service_odoo_runtime(self, unit, config_path=""):
+        """Runtime Odoo validado, reutilizable por operaciones tipadas."""
+        return self._service_odoo_runtime(unit, config_path)
+
     def _copy_client_image_with_odoo(
         self,
         database_name,

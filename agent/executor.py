@@ -7,6 +7,7 @@ from .commands import (
 from .discovery import OdooServiceDiscovery
 from .provisioner import OdooProvisioner
 from .database_manager import DatabaseManager
+from .scheduled_backup import ScheduledBackupManager
 from .bootstrap import ServerBootstrapAuditor
 from .server_configurator import ServerConfigurator
 from .updater import AgentUpdater
@@ -30,6 +31,12 @@ class JobExecutor:
 
         self.database_manager = DatabaseManager(
             config
+        )
+
+        self.scheduled_backup_manager = ScheduledBackupManager(
+            config,
+            discovery=self.discovery,
+            database_manager=self.database_manager,
         )
 
         self.bootstrap_auditor = ServerBootstrapAuditor(
@@ -156,6 +163,9 @@ class JobExecutor:
 
             "database.backup":
                 self.database_backup,
+
+            "database.backup.scheduled":
+                self.database_backup_scheduled,
 
             "database.restore":
                 self.database_restore,
@@ -797,6 +807,13 @@ class JobExecutor:
                 payload,
                 progress_callback=self._progress,
             )
+        )
+
+    def database_backup_scheduled(self, payload):
+        payload = payload if isinstance(payload, dict) else {}
+        return self.scheduled_backup_manager.run(
+            frequency=payload.get("frequency") or "daily",
+            progress_callback=self._progress,
         )
 
     def database_restore(
