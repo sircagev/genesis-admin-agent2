@@ -162,6 +162,10 @@ class ControllerClient:
             {},
         )
 
+    def rclone_config(self):
+        """Obtiene el secreto solo por canal autenticado, nunca en un job."""
+        return self._post("/infra/agent/v1/config/rclone", {})
+
     def next_job(self):
         return self._post(
             "/infra/agent/v1/jobs/next",

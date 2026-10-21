@@ -45,6 +45,15 @@ sudo genesis-agent backup daily --dry-run
 Una lista vacía de `scheduled_backup.database_names` selecciona todas las bases
 asociadas; una lista con nombres limita el alcance de forma explícita.
 
+## Configuración rclone desde Odoo
+
+El remoto se administra desde Odoo mediante el trabajo `rclone.configure`.
+Después de validarlo, el Agent guarda el destino recibido —por ejemplo
+`gendrive:odoo-backups`— como `scheduled_backup.rclone_remote`. Las credenciales
+nunca se incluyen en el trabajo: se recuperan desde el Controller autenticado.
+El estado de activación también proviene del campo **Activar backups** de Odoo;
+no se edita manualmente el archivo de configuración del Agent.
+
 ## Instalador idempotente
 
 `install.sh` se puede ejecutar nuevamente. Si la instalación ya tiene

@@ -8,6 +8,7 @@ from .discovery import OdooServiceDiscovery
 from .provisioner import OdooProvisioner
 from .database_manager import DatabaseManager
 from .scheduled_backup import ScheduledBackupManager
+from .rclone_configurator import RcloneConfigurator
 from .bootstrap import ServerBootstrapAuditor
 from .server_configurator import ServerConfigurator
 from .updater import AgentUpdater
@@ -38,6 +39,7 @@ class JobExecutor:
             discovery=self.discovery,
             database_manager=self.database_manager,
         )
+        self.rclone_configurator = RcloneConfigurator(config)
 
         self.bootstrap_auditor = ServerBootstrapAuditor(
             progress_callback=self._progress
@@ -166,6 +168,8 @@ class JobExecutor:
 
             "database.backup.scheduled":
                 self.database_backup_scheduled,
+
+            "rclone.configure": self.rclone_configure,
 
             "database.restore":
                 self.database_restore,
@@ -815,6 +819,12 @@ class JobExecutor:
             frequency=payload.get("frequency") or "daily",
             progress_callback=self._progress,
         )
+
+    def rclone_configure(self, _payload):
+        self._progress("rclone", 25, "Obteniendo configuración segura de rclone.")
+        result = self.rclone_configurator.configure()
+        self._progress("finished", 100, "Remoto rclone validado.")
+        return result
 
     def database_restore(
         self,
