@@ -54,6 +54,11 @@ nunca se incluyen en el trabajo: se recuperan desde el Controller autenticado.
 El estado de activación también proviene del campo **Activar backups** de Odoo;
 no se edita manualmente el archivo de configuración del Agent.
 
+Cuando se ejecuta ese trabajo, el Agent comprueba si `rclone` está disponible.
+Si falta, en servidores Debian/Ubuntu donde el Agent corre como `root`, ejecuta
+`apt-get update` e instala el paquete `rclone`; si ya existe, continúa
+directamente con la configuración y validación del remoto.
+
 ## Instalador idempotente
 
 `install.sh` se puede ejecutar nuevamente. Si la instalación ya tiene

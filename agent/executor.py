@@ -39,7 +39,10 @@ class JobExecutor:
             discovery=self.discovery,
             database_manager=self.database_manager,
         )
-        self.rclone_configurator = RcloneConfigurator(config)
+        self.rclone_configurator = RcloneConfigurator(
+            config,
+            progress_callback=self._progress,
+        )
 
         self.bootstrap_auditor = ServerBootstrapAuditor(
             progress_callback=self._progress
@@ -821,7 +824,7 @@ class JobExecutor:
         )
 
     def rclone_configure(self, _payload):
-        self._progress("rclone", 25, "Obteniendo configuración segura de rclone.")
+        self._progress("rclone", 5, "Verificando disponibilidad de rclone.")
         result = self.rclone_configurator.configure()
         self._progress("finished", 100, "Remoto rclone validado.")
         return result

@@ -36,6 +36,9 @@ class RcloneConfiguratorTest(unittest.TestCase):
             client = SimpleNamespace(rclone_config=lambda: self._payload())
             config = self.FakeConfig()
             with patch.object(RcloneConfigurator, "_path", return_value=path), patch(
+                "agent.rclone_configurator.shutil.which",
+                return_value="/usr/bin/rclone",
+            ), patch(
                 "agent.rclone_configurator.subprocess.run",
                 return_value=SimpleNamespace(returncode=0),
             ) as run:
@@ -53,6 +56,7 @@ class RcloneConfiguratorTest(unittest.TestCase):
             self.assertEqual(config.data["scheduled_backup"]["rclone_remote"], "odoo-backups:odoo-backups")
             self.assertTrue(config.data["scheduled_backup"]["enabled"])
             self.assertEqual(config.saved, 1)
+            self.assertFalse(result["rclone_installed"])
 
     def test_restores_existing_configuration_when_validation_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -62,6 +66,9 @@ class RcloneConfiguratorTest(unittest.TestCase):
             client = SimpleNamespace(rclone_config=lambda: self._payload())
             config = self.FakeConfig()
             with patch.object(RcloneConfigurator, "_path", return_value=path), patch(
+                "agent.rclone_configurator.shutil.which",
+                return_value="/usr/bin/rclone",
+            ), patch(
                 "agent.rclone_configurator.subprocess.run",
                 return_value=SimpleNamespace(returncode=1),
             ):
@@ -77,3 +84,31 @@ class RcloneConfiguratorTest(unittest.TestCase):
         values["remote_name"] = "invalid remote"
         with self.assertRaises(CommandError):
             RcloneConfigurator._validate(values)
+
+    def test_installs_rclone_before_configuring_when_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rclone.conf"
+            client = SimpleNamespace(rclone_config=lambda: self._payload())
+            config = self.FakeConfig()
+            completed = SimpleNamespace(returncode=0)
+            with patch.object(RcloneConfigurator, "_path", return_value=path), patch(
+                "agent.rclone_configurator.os.geteuid",
+                return_value=0,
+            ), patch(
+                "agent.rclone_configurator.shutil.which",
+                side_effect=[None, "/usr/bin/apt-get", "/usr/bin/rclone"],
+            ), patch(
+                "agent.rclone_configurator.subprocess.run",
+                side_effect=[completed, completed, completed],
+            ) as run:
+                result = RcloneConfigurator(config, client=client).configure()
+
+            self.assertTrue(result["rclone_installed"])
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list],
+                [
+                    ["/usr/bin/apt-get", "update"],
+                    ["/usr/bin/apt-get", "install", "-y", "rclone"],
+                    ["rclone", "lsd", "odoo-backups:odoo-backups"],
+                ],
+            )

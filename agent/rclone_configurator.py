@@ -2,6 +2,7 @@
 import configparser
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -13,9 +14,14 @@ REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 class RcloneConfigurator:
-    def __init__(self, config, client=None):
+    def __init__(self, config, client=None, progress_callback=None):
         self.config = config
         self.client = client or ControllerClient(config)
+        self.progress_callback = progress_callback
+
+    def _progress(self, stage, percent, message):
+        if callable(self.progress_callback):
+            self.progress_callback(stage, percent, message)
 
     @staticmethod
     def _validate(values):
@@ -34,7 +40,43 @@ class RcloneConfigurator:
     def _path():
         return Path("/root/.config/rclone/rclone.conf")
 
+    def _ensure_rclone(self):
+        """Instala rclone solo cuando no está disponible en el Agent."""
+        if shutil.which("rclone"):
+            self._progress("rclone", 25, "rclone ya está instalado.")
+            return False
+        if os.geteuid() != 0:
+            raise CommandError(
+                "rclone no está instalado y el Agent no tiene permisos root para instalarlo."
+            )
+        apt_get = shutil.which("apt-get")
+        if not apt_get:
+            raise CommandError(
+                "rclone no está instalado y este sistema no dispone de apt-get."
+            )
+
+        self._progress("rclone_install", 15, "rclone no está instalado; actualizando índices APT.")
+        for command, message in (
+            ([apt_get, "update"], "No fue posible actualizar los índices APT para instalar rclone."),
+            ([apt_get, "install", "-y", "rclone"], "No fue posible instalar rclone."),
+        ):
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            if result.returncode:
+                raise CommandError(message)
+        if not shutil.which("rclone"):
+            raise CommandError("rclone no quedó disponible después de la instalación.")
+        self._progress("rclone_install", 40, "rclone instalado correctamente.")
+        return True
+
     def configure(self):
+        rclone_installed = self._ensure_rclone()
+        self._progress("rclone", 55, "Obteniendo configuración segura de rclone.")
         values = self.client.rclone_config()
         if not values.get("success"):
             raise CommandError(values.get("message") or "No se obtuvo configuración rclone.")
@@ -68,6 +110,7 @@ class RcloneConfigurator:
             os.replace(temporary, path)
         finally:
             Path(temporary).unlink(missing_ok=True)
+        self._progress("rclone", 80, "Validando remoto rclone.")
         result = subprocess.run(["rclone", "lsd", destination], stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, check=False)
         if result.returncode:
@@ -87,6 +130,7 @@ class RcloneConfigurator:
             "remote_path": remote_path,
             "backup_remote": destination,
             "backup_enabled": backup["enabled"],
+            "rclone_installed": rclone_installed,
             "config_path": str(path),
             "message": "Remoto rclone configurado, validado y sincronizado con backups.",
         }
